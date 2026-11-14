@@ -8,7 +8,7 @@
     <LangVersion>latest</LangVersion>
     <Deterministic>true</Deterministic>
 
-    <VersionPrefix>0.1.0</VersionPrefix>
+    <VersionPrefix>0.2.0</VersionPrefix>
     <Authors>Bogware</Authors>
     <Company>Bogware</Company>
     <Copyright>Copyright (c) Bogware</Copyright>
