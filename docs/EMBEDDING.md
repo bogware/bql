@@ -70,6 +70,12 @@ The rule is simple. If you say you do something, do it exactly as the pipeline w
 
 `ExactPredicates` decides per predicate. A predicate is a field, an operator (`=`, `!=`, `>`, `>=`, `<`, `<=`) and a literal. Say yes only to the ones you compare exactly as BQL does: text ignoring case, numbers as numbers, a missing field never matching, a list matching when any of its values does (and `!=` when none does).
 
+`BqlComparison.Holds(op, value, literal)` is that comparison. It runs the engine's own code, so a source that filters with it, or registers it as a function in its database to filter there, can't drift from the pipeline. `value` is the row's value (null when missing, a list for a multi-value) and `literal` is the predicate's `Value`.
+
+```csharp
+var kept = rows.Where(row => BqlComparison.Holds(p.Operator, row.GetValueOrDefault(p.Field), p.Value));
+```
+
 ## The pushdown
 
 | Member | Meaning |

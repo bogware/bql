@@ -6,6 +6,11 @@ All notable changes to this project are written here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `BqlComparison.Holds(op, value, literal)`: the engine's comparison, for a source that applies
+  predicates itself. It is the code `where` runs, so the two can't differ.
+
 ## [0.1.0] - 2026-11-14
 
 The first release. BQL comes out of Cabinet and stands on its own.

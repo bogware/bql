@@ -156,11 +156,15 @@ public static class BqlExpressionEvaluator
         };
     }
 
-    private static object EvaluateComparison(ComparisonExpression expr, IDictionary<string, object?> context)
-    {
-        var left = Evaluate(expr.Left, context);
-        var right = Evaluate(expr.Right, context);
+    private static object EvaluateComparison(ComparisonExpression expr, IDictionary<string, object?> context) =>
+        Compare(expr.Operator, Evaluate(expr.Left, context), Evaluate(expr.Right, context));
 
+    /// <summary>
+    /// The one comparison the engine makes, for <c>where</c> and for <see cref="BqlComparison.Holds"/>,
+    /// so the two can't differ.
+    /// </summary>
+    internal static bool Compare(string op, object? left, object? right)
+    {
         // As in SPL, comparing with a missing value is never true, for != too: use isnull() for that
         if (left == null || right == null) return false;
 
@@ -171,12 +175,12 @@ public static class BqlExpressionEvaluator
         {
             var present = values.Where(v => v != null).Select(v => v!).ToList();
             if (present.Count == 0) return false;
-            return expr.Operator is "!=" or "<>"
+            return op is "!=" or "<>"
                 ? present.All(v => !CompareScalars("=", v, right))
-                : present.Any(v => CompareScalars(expr.Operator, v, right));
+                : present.Any(v => CompareScalars(op, v, right));
         }
 
-        return CompareScalars(expr.Operator, left, right);
+        return CompareScalars(op, left, right);
     }
 
     private static bool CompareScalars(string op, object? left, object? right)
