@@ -515,7 +515,7 @@ Times are in UTC. Epochs are in seconds. Formats use `%Y %y %m %d %H %I %M %S %p
 
 ### Comparisons and missing values
 
-As in SPL, a comparison with a missing value is false, whatever the operator: `where status != 200` leaves out events with no `status`. Use `isnull(status)` to find those. In a condition, `"false"`, `"0"` and empty text are false. `if`, `case`, `validate` and `coalesce` only evaluate the branch they take.
+As in SPL, a comparison with a missing value is false, whatever the operator: `where status != 200` leaves out events with no `status`. Use `isnull(status)` to find those. A multi-value field compares value by value: `where tags = "tax"` holds when any value is `tax`, and `where tags != "tax"` when none is. An empty list counts as missing. In a condition, `"false"`, `"0"` and empty text are false. `if`, `case`, `validate` and `coalesce` only evaluate the branch they take.
 
 ### Utility Functions
 

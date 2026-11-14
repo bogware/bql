@@ -121,6 +121,23 @@ public static class BqlExpressionEvaluator
         // As in SPL, comparing with a missing value is never true, for != too: use isnull() for that
         if (left == null || right == null) return false;
 
+        // A multi-value field compares value by value, as SPL's search does: = and the ordering
+        // operators hold when any value satisfies them, != when no value equals. An empty list is
+        // treated as missing.
+        if (AsMultiValue(left) is { } values && AsMultiValue(right) is null)
+        {
+            var present = values.Where(v => v != null).Select(v => v!).ToList();
+            if (present.Count == 0) return false;
+            return expr.Operator is "!=" or "<>"
+                ? present.All(v => !CompareScalars("=", v, right))
+                : present.Any(v => CompareScalars(expr.Operator, v, right));
+        }
+
+        return CompareScalars(expr.Operator, left, right);
+    }
+
+    private static bool CompareScalars(string op, object? left, object? right)
+    {
         // A time compared with a date string compares as times
         left = CoerceTimeOperand(left, right);
         right = CoerceTimeOperand(right, left);
@@ -135,7 +152,7 @@ public static class BqlExpressionEvaluator
             var absMax = Math.Max(Math.Abs(numLeft.Value), Math.Abs(numRight.Value));
             var areEqual = diff <= 1e-9 || (absMax > 0 && diff / absMax < 1e-9);
 
-            return expr.Operator switch
+            return op switch
             {
                 "=" or "==" => areEqual,
                 "!=" or "<>" => !areEqual,
@@ -152,7 +169,7 @@ public static class BqlExpressionEvaluator
         var strRight = right?.ToString() ?? "";
         var cmp = string.Compare(strLeft, strRight, StringComparison.OrdinalIgnoreCase);
 
-        return expr.Operator switch
+        return op switch
         {
             "=" or "==" => cmp == 0,
             "!=" or "<>" => cmp != 0,

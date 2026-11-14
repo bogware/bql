@@ -6,6 +6,12 @@ All notable changes to this project are written here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Comparisons on a multi-value field now look at each value, as SPL's search does: `=` and the
+  ordering operators hold when any value satisfies them, `!=` when no value equals. An empty list
+  counts as missing. Before, a list never equaled anything.
+
 ## [0.1.0] - 2026-11-14
 
 The first release. BQL comes out of Cabinet and stands on its own.

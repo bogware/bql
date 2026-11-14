@@ -68,7 +68,7 @@ public BqlSourceCapabilities Capabilities { get; } = new()
 
 The rule is simple. If you say you do something, do it exactly as the pipeline would. The engine takes your word and removes that work from the pipeline. If you can only narrow, don't claim it; the engine will check.
 
-`ExactPredicates` decides per predicate. A predicate is a field, an operator (`=`, `!=`, `>`, `>=`, `<`, `<=`) and a literal. Say yes only to the ones you compare exactly as BQL does: text ignoring case, numbers as numbers, a missing field never matching.
+`ExactPredicates` decides per predicate. A predicate is a field, an operator (`=`, `!=`, `>`, `>=`, `<`, `<=`) and a literal. Say yes only to the ones you compare exactly as BQL does: text ignoring case, numbers as numbers, a missing field never matching, a list matching when any of its values does (and `!=` when none does).
 
 ## The pushdown
 

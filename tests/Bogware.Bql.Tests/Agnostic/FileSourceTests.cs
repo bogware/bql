@@ -161,6 +161,26 @@ public sealed class FileSourceTests
 
     [Theory]
     [MemberData(nameof(BothSources))]
+    public async Task Where_OnAList_HoldsWhenAnyValueMatches(bool exact)
+    {
+        var rows = await RunAsync("find * | where tags = \"photo\" | table name", exact);
+
+        rows.Select(r => r["name"]).Should().BeEquivalentTo(["beach.jpg", "beach-copy.jpg"]);
+    }
+
+    [Theory]
+    [MemberData(nameof(BothSources))]
+    public async Task NotEquals_OnAList_HoldsWhenNoValueMatches_AndAnEmptyListIsMissing(bool exact)
+    {
+        var rows = await RunAsync("find * | where tags != \"photo\" | table name", exact);
+        var names = rows.Select(r => (string)r["name"]!).ToList();
+
+        names.Should().Contain(["taxes-2025.pdf", "lease.pdf"]);
+        names.Should().NotContain(["beach.jpg", "beach-copy.jpg", "song.flac"]);
+    }
+
+    [Theory]
+    [MemberData(nameof(BothSources))]
     public async Task Words_SearchTheSchemasTextField(bool exact)
     {
         var rows = await RunAsync("find beach | table name", exact);
