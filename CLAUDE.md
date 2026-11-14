@@ -18,12 +18,13 @@ Key types: `BqlQueryEngine`, `IBqlSource`, `BqlSchema`, `BqlSourceCapabilities`,
 ## Invariants
 
 1. **No field names in the engine.** No `host`, `severity`, `RawLine`, `Timestamp`, `index`. Time, text, datasets, levels and aliases come from `BqlSchema`. The only names the engine knows are SPL's defaults, `_time` and `_raw`, and they live in `BqlSchema`.
-2. **No magic numbers.** Every limit, size and timeout is a property of `BqlEngineOptions`, `BqlLimits` or `BqlParserLimits`, with a default and a doc comment. A constant that is part of the language's meaning (the median is the 50th percentile, `list()` keeps 100 values as in SPL) is a named constant with a comment saying so.
+2. **No magic numbers.** Every limit, size and timeout is a property of `BqlEngineOptions`, `BqlLimits` or `BqlParserLimits` (in Natural, `QueryUnderstander` and `NaturalReader`), init-only, with a default and a doc comment. Limits belong to an engine, never to the process: no static, settable limits. A constant that is part of the language's meaning (the median is the 50th percentile, `list()` keeps 100 values as in SPL) or an internal guard (how often eager stages check for cancellation, the timeout on the engine's own fixed patterns) is a named constant with a comment saying so.
 3. **Pushdown is a promise.** The optimizer removes a stage from the pipeline only when the source said, through `BqlSourceCapabilities`, that it does that work exactly. Narrowing hints (datasets, time from a `where`) never remove a stage.
 4. **A source that does nothing gets the right answer.** `PlainMemoryBqlEndToEndTests` runs every end-to-end query against a source with no capabilities. Both must agree.
 5. **The parser is shared.** `ParseBql` makes fresh state per call. Don't add mutable fields read across calls.
 6. **The engine writes nothing.** No logging packages. Report through `BqlEngineOptions.Diagnostics` and the `Bogware.Bql` activity source.
 7. **Wrong is worse than slow.** An aggregating source returns null rather than an answer that might differ. A subsearch that fails fails the query, except `append`, which keeps SPL's behavior.
+8. **Queries are untrusted.** Anything that runs a query (a subsearch, a macro, a join) runs it as the caller: the same `AllowedDatasets`, `Dataset`, time range and what is left of the timeout, through `BqlQueryEngine.ExecuteSubsearchAsync`. Subsearches and macros share one nesting budget. Every value, multi-value and row set a query can grow is held to a limit. Stages that hold rows check the token every `CancellationCheckInterval` rows. `Parse`, `Validate` and `ExecuteAsync` throw only `BqlParseException` and its subclasses, or cancellation; never catch `OutOfMemoryException`. Error messages a query author sees carry no internals: inner exceptions go to `Diagnostics`.
 
 ## Commands
 

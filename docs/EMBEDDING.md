@@ -93,11 +93,51 @@ Two optional interfaces let a source skip reading rows altogether.
 
 ## Options
 
-`BqlEngineOptions` holds every limit: rows in memory, groups, retained values, rows scanned, batch sizes, subsearch sizes, macro depth, parser limits, timeouts. Each has a default and a doc comment. A host shows the ones its users should see.
+`BqlEngineOptions` holds every limit: rows in memory, groups, retained values, rows scanned, value sizes, batch sizes, subsearch sizes, nesting depth, parser limits, timeouts. Each has a default and a doc comment, and none can change once the options are made. Limits belong to the engine they were given to; two engines in one process can have different ones. A host shows the ones its users should see.
 
-Lookup tables and macros come from `IBqlKnowledgeProvider`. GeoIP comes from `IBqlGeoIpLookup`. Leave them null and the stages that need them say so.
+Lookup tables and macros come from `IBqlKnowledgeProvider`. Each call says who is asking: a `BqlCaller` with the query's `AllowedDatasets` and `Dataset`. Return null for a table or macro that caller may not use. GeoIP comes from `IBqlGeoIpLookup`. Leave them null and the stages that need them say so.
 
 `Diagnostics` takes a callback for things worth logging. The engine writes nothing on its own. It traces with an `ActivitySource` named `Bogware.Bql`.
+
+## Running untrusted queries
+
+BQL is built to run queries typed by people the host doesn't trust. The engine does its part; the host does the rest.
+
+What the engine does:
+
+- **Subsearches run as the caller.** `append`, `join`, `multisearch`, `subsearch` and macros run with the outer query's `AllowedDatasets`, `Dataset`, time range and whatever is left of its timeout. Nested ones too.
+- **Nesting stops.** Subsearches and macros share one budget, `MaxNestingDepth` (default 10). A macro that calls itself, directly or through a subsearch, fails with `BqlLimitExceededException`.
+- **Memory is bounded.** Rows a stage holds, groups, retained values, the size of one value and the number of values in one field all have limits. A query that would pass one stops with `BqlLimitExceededException`, or, for row caps, returns what fits with `Statistics.Truncated` set.
+- **Time is bounded.** `ExecuteAsync` honours `Timeout` (default 60 seconds) and the caller's token, inside stages that hold rows too. Each regular expression has a time per row.
+- **Errors are BQL errors.** `Parse`, `Validate` and `ExecuteAsync` throw `BqlParseException` or one of its subclasses (`BqlExecutionException`, `BqlLimitExceededException`), or `OperationCanceledException` when time runs out. Their messages are safe to show the person who typed the query. Inner exceptions, which may carry paths, hosts or stack traces, go only to `Diagnostics`.
+
+The limits that matter most, with their defaults:
+
+| Limit | Default | What it bounds |
+|---|---|---|
+| `BqlEngineOptions.DefaultTimeout` | 60 s | One query, subsearches included |
+| `BqlEngineOptions.MaxNestingDepth` | 10 | Subsearches and macros inside each other |
+| `BqlEngineOptions.SubsearchResultLimit` | 50,000 | Rows one subsearch returns |
+| `BqlLimits.MaxRowsInMemory` | 100,000 | Rows a stage holds (`sort`, `join`, `mvexpand`, `append`...) |
+| `BqlLimits.MaxGroups` | 100,000 | Groups in `stats`, `eventstats`, `streamstats` |
+| `BqlLimits.MaxRetainedValues` | 20,000,000 | Values held for `dc`, `values`, percentiles |
+| `BqlLimits.MaxValueLength` | 1,000,000 | Characters in one value, or in one field's values together |
+| `BqlLimits.MaxMultiValueCount` | 10,000 | Values in one multi-value field |
+| `BqlLimits.MaxStreamStatsWindow` | 10,000 | `streamstats window=` |
+| `BqlLimits.MaxMakeResults` | 50,000 | Rows `makeresults` makes |
+| `BqlLimits.RegexTimeoutPerRow` | 250 ms | One pattern on one row |
+| `BqlLimits.MaxRegexTimeouts` | 8 | Rows a pattern may time out on before the query stops |
+| `BqlLimits.MaxEventsScanned` | none | Rows read from the source |
+| `BqlParserLimits.MaxQueryLength` | 100,000 | Characters in a query |
+| `QueryUnderstander.MaxInputLength` | 2,000 | Characters read as a question; longer input is parsed strictly |
+
+What the host must do:
+
+- **Enforce `AllowedDatasets` in your source.** The engine passes it in `BqlPushdown.AllowedDatasets` on every read, subsearches included, and trusts you to apply it. A source that ignores it lets any query read any dataset.
+- **Treat names from queries as untrusted.** Lookup and macro names in `IBqlKnowledgeProvider` calls come straight from query text. Check them against the `BqlCaller` you are given, and never use one as a path or in a query of your own without escaping it.
+- **Set limits for your hardware and your users.** The defaults suit one interactive user on a server. A host serving many users lowers `MaxRowsInMemory`, `MaxRetainedValues` and `DefaultTimeout`, and sets `MaxEventsScanned`.
+- **Limit how many queries run at once.** The engine bounds one query, not how many a user starts.
+- **Log `Diagnostics`, don't show it.** It carries the detail kept out of user-facing messages.
 
 ## Other languages
 

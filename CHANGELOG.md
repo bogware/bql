@@ -6,7 +6,39 @@ All notable changes to this project are written here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Subsearches (`append`, `join`, `multisearch`, `subsearch`) and macros now run with the outer
+  query's `AllowedDatasets`, `Dataset`, time range and remaining timeout. Before, a subsearch
+  ran with none of them and could read any dataset.
+- Subsearches and macros share one nesting budget, `BqlEngineOptions.MaxNestingDepth`. A macro
+  that called itself through a subsearch overflowed the stack and ended the process.
+- Values, multi-values and the rows `mvexpand` and `join` make are held to limits. `mvrange`
+  counts its steps, so a step too small to change a large number no longer loops forever.
+- Stages that hold rows (`sort`, `streamstats`, `eventstats`, `transaction`, `mvexpand`, `join`,
+  `fieldsummary`) stop when the query's time is up. `streamstats` and `eventstats` count against
+  the group and value limits.
+- `Parse`, `Validate` and `ExecuteAsync` throw only BQL errors. Numbers too large to hold, digits
+  from other scripts, bad `rex` and `regex` patterns, and spans of zero are parse errors; huge
+  `printf` widths, bad `memk` input and snapping before the first date give a value or null.
+- The plain-English reader no longer uses patterns that backtrack on long words, and reads at
+  most `MaxInputLength` characters as a question.
+- Lookup and macro providers are told who is asking.
+- A failed subsearch or join tells the query author it failed and nothing more. The detail goes
+  to `Diagnostics`.
+
 ### Changed
+
+- **Breaking.** `IBqlKnowledgeProvider.GetLookupAsync` and `GetMacroAsync` take a `BqlCaller`.
+- **Breaking.** `BqlEngineOptions.MaxMacroDepth` is now `MaxNestingDepth` and covers subsearches.
+- **Breaking.** `BqlLimits` properties are init-only. The static `BqlRegex.PerEventTimeout` is
+  gone; set `BqlLimits.RegexTimeoutPerRow` per engine.
+- New limits: `BqlLimits.RegexTimeoutPerRow`, `MaxValueLength`, `MaxMultiValueCount`,
+  `MaxStreamStatsWindow`, `MaxMakeResults`, `MaxPatternLength`, `MaxPadWidth`,
+  `MaxFormatPrecision`, `MaxFieldSummaryValues`; `BqlParserLimits.MaxSearchDepth`,
+  `MaxTransactionEvents`; `QueryUnderstander.MaxInputLength`, `NaturalReader.MaxInputLength`.
+  The defaults keep earlier behavior where it was already bounded.
+- `BqlTextSearch.Parse` has an overload that takes a depth limit.
 
 - Comparisons on a multi-value field now look at each value, as SPL's search does: `=` and the
   ordering operators hold when any value satisfies them, `!=` when no value equals. An empty list
