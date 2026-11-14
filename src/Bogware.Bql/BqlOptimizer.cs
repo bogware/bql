@@ -101,6 +101,9 @@ public sealed class BqlOptimizer
             pushdown.TextTerms = null;
         }
 
+        // Only now are the stages final; a source may leave the text out when none can see it
+        pushdown.NeedsText = BqlTextUse.Needed(remainingStages, _schema);
+
         return new OptimizedQuery
         {
             Pushdown = pushdown,

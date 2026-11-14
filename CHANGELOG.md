@@ -8,6 +8,9 @@ All notable changes to this project are written here. The format follows
 
 ### Added
 
+- `BqlPushdown.NeedsText`. False when the engine can show that no stage reads the text field and
+  it can't reach the output, so a source may leave large text out of its rows. It is true for
+  anything the engine isn't sure about.
 - `BqlComparison.Holds(op, value, literal)`: the engine's comparison, for a source that applies
   predicates itself. It is the code `where` runs, so the two can't differ.
 - Size literals in expressions: `where size > 10MB`. `B`, `KB`, `MB`, `GB`, `TB`, `PB` and

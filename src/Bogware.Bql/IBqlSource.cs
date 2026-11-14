@@ -113,6 +113,15 @@ public sealed class BqlPushdown
     /// <summary>Where a previous page stopped, passed through from the caller.</summary>
     public string? After { get; set; }
 
+    /// <summary>
+    /// Whether the rows need the schema's text field. False only when the engine has shown that
+    /// no stage reads the text and it can't reach the output, as in <c>stats count by ext</c>.
+    /// Then a source may leave the text field and its synonyms out of the rows, which saves
+    /// reading large text. It must still apply <see cref="TextTerms"/> exactly if it claimed
+    /// <see cref="BqlSourceCapabilities.TextSearch"/>. True by default.
+    /// </summary>
+    public bool NeedsText { get; set; } = true;
+
     /// <summary>A copy, to change for one read.</summary>
     public BqlPushdown Clone() => new()
     {
@@ -125,6 +134,7 @@ public sealed class BqlPushdown
         Sort = Sort,
         Limit = Limit,
         After = After,
+        NeedsText = NeedsText,
     };
 }
 

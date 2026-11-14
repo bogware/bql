@@ -293,6 +293,15 @@ public static class BqlExpressionEvaluator
         return regex.IsMatch(value);
     }
 
+    /// <summary>
+    /// Functions that read fields they aren't given as arguments. The optimizer asks, to know
+    /// whether a query reads the text field, so a new function that reads the row goes here.
+    /// </summary>
+    private static readonly HashSet<string> WholeRowFunctions = new(StringComparer.Ordinal) { "searchmatch" };
+
+    /// <summary>Whether a function reads fields beyond its arguments.</summary>
+    internal static bool ReadsTheWholeRow(string function) => WholeRowFunctions.Contains(function);
+
     private static object? EvaluateFunction(FunctionExpression func, IDictionary<string, object?> context)
     {
         // Only the branch taken is evaluated, so an untaken one can't cost time or fail

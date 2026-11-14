@@ -88,6 +88,9 @@ var kept = rows.Where(row => BqlComparison.Holds(p.Operator, row.GetValueOrDefau
 | `Sort` | The order wanted. Honor it if you claimed `TimeOrder`. |
 | `Limit` | Most rows the engine will take, when it knows. A hint. |
 | `After` | An opaque cursor from the caller, for paging. |
+| `NeedsText` | Whether rows need the text field. When false, you may leave the text field and its synonyms out of the rows. You must still apply `TextTerms` exactly if you claimed `TextSearch`. |
+
+`NeedsText` is false only when the engine can show that nothing after the read sees the text: the query ends in a `table`, `fields`, `stats`, `chart`, `timechart`, `top` or `rare` that doesn't name it, and no stage before that reads it. `stats count by ext` doesn't need the text; `invoice | table name` doesn't either when you searched the words yourself. A search the pipeline checks, `rex` or `regex` without a field, `searchmatch`, subsearches, `transaction`, `lookup`, `fieldsummary` and anything else the engine can't be sure about need it. A source whose text is large, such as the extracted contents of documents, saves reading it.
 
 ## Doing more
 
