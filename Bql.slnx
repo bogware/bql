@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Bogware.Bql.Natural/Bogware.Bql.Natural.csproj" />
+    <Project Path="src/Bogware.Bql/Bogware.Bql.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Bogware.Bql.Tests/Bogware.Bql.Tests.csproj" />
+  </Folder>
+</Solution>

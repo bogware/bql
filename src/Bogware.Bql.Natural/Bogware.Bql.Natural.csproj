@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Bogware.Bql.Natural</RootNamespace>
+    <PackageId>Bogware.Bql.Natural</PackageId>
+    <Description>Reads plain-English questions into BQL, offline, with a vocabulary the host supplies.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Bogware.Bql\Bogware.Bql.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Bogware.Bql.Tests" />
+  </ItemGroup>
+
+</Project>

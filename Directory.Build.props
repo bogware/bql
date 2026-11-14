@@ -1,0 +1,20 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+
+    <VersionPrefix>0.1.0</VersionPrefix>
+    <Authors>Bogware</Authors>
+    <Company>Bogware</Company>
+    <Copyright>Copyright (c) Bogware</Copyright>
+    <PackageLicenseExpression>AGPL-3.0-only</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/bogware/bql</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/bogware/bql</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+</Project>

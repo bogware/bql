@@ -1,0 +1,241 @@
+
+namespace Bogware.Bql.Tests.Cabinet;
+
+public class BqlOptimizerTests
+{
+    private readonly BqlParser _parser = new(LogSchema.Instance);
+    private readonly BqlOptimizer _optimizer = new(LogSchema.Instance, InMemoryStorage.Exact);
+
+    [Fact]
+    public void Optimize_SearchText_PushedToStorageContext()
+    {
+        var query = _parser.ParseBql("find errors");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.StorageContext.SearchText.Should().Be("errors");
+        // Search stage should be consumed (pushed down)
+        optimized.RemainingStages.Should().NotContain(s => s is SearchStage);
+    }
+
+    [Theory]
+    [InlineData("find index=web error", "web")]
+    [InlineData("find error index=Web", "Web")]
+    [InlineData("find * | where index=\"web\"", "web")]
+    public void IndexTerms_NarrowStorage_AndTheStageStaysToDecideExactly(string text, string index)
+    {
+        // Every backend matches index names ignoring case, so storage reads a superset
+        var optimized = _optimizer.Optimize(_parser.ParseBql(text));
+
+        optimized.StorageContext.AllowedIndexes.Should().Equal(index);
+        optimized.RemainingStages.Should().Contain(s => s is SearchStage || s is WhereStage);
+    }
+
+    [Theory]
+    [InlineData("find index=web OR index=db")]
+    [InlineData("find NOT index=web")]
+    [InlineData("find index=we*")]
+    [InlineData("find index!=web")]
+    public void IndexTerms_ThatArentAllRequired_DontNarrow(string text)
+    {
+        _optimizer.Optimize(_parser.ParseBql(text)).StorageContext.AllowedIndexes.Should().BeNull();
+    }
+
+    [Fact]
+    public void TwoDifferentIndexes_NarrowToNothing()
+    {
+        _optimizer.Optimize(_parser.ParseBql("find index=web index=db")).StorageContext.AllowedIndexes.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Optimize_WildcardSearch_NoPredicate()
+    {
+        var query = _parser.ParseBql("find *");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.StorageContext.SearchText.Should().BeNull();
+    }
+
+    [Fact]
+    public void Optimize_TimeRange_PushedToStorageContext()
+    {
+        var query = _parser.ParseBql("find errors from last 24h");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.StorageContext.StartTime.Should().NotBeNull();
+        optimized.StorageContext.EndTime.Should().NotBeNull();
+    }
+
+    [Fact]
+    public void Optimize_SimpleSeverityWhere_PushedDown()
+    {
+        var query = _parser.ParseBql("find * | where Severity >= 4");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.StorageContext.MinSeverity.Should().Be(LogSeverity.Error);
+        optimized.RemainingStages.Should().NotContain(s => s is WhereStage);
+    }
+
+    [Fact]
+    public void Optimize_CustomFieldEquality_StaysInPipeline()
+    {
+        // Backends compare JSON values by exact type and case; the pipeline doesn't.
+        var query = _parser.ParseBql("find * | where status = \"200\"");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.StorageContext.FieldFilters.Should().BeNull();
+        optimized.RemainingStages.Should().ContainSingle(s => s is WhereStage);
+    }
+
+    [Fact]
+    public void Optimize_SimpleSort_PushedDown()
+    {
+        var query = _parser.ParseBql("find * | sort by Timestamp desc");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.StorageContext.SortField.Should().Be("Timestamp");
+        optimized.StorageContext.SortDescending.Should().BeTrue();
+        optimized.RemainingStages.Should().NotContain(s => s is SortStage);
+    }
+
+    [Fact]
+    public void Optimize_OrSameField_StaysInPipeline()
+    {
+        var query = _parser.ParseBql("find * | where status = 200 or status = 500");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.StorageContext.FieldFilters.Should().BeNull();
+        optimized.RemainingStages.Should().ContainSingle(s => s is WhereStage);
+    }
+
+    [Fact]
+    public void Optimize_OrDifferentFields_RemainsInPipeline()
+    {
+        var query = _parser.ParseBql("find * | where status = 200 or host = \"web-01\"");
+        var optimized = _optimizer.Optimize(query);
+
+        // OR on different fields cannot be pushed down
+        optimized.RemainingStages.Should().Contain(s => s is WhereStage);
+    }
+
+    [Fact]
+    public void Optimize_StatsStage_RemainsInPipeline()
+    {
+        var query = _parser.ParseBql("find * | stats count by host");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.RemainingStages.Should().Contain(s => s is StatsStage);
+    }
+
+    [Fact]
+    public void Optimize_EvalStage_RemainsInPipeline()
+    {
+        var query = _parser.ParseBql("find * | eval total = price * quantity");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.RemainingStages.Should().Contain(s => s is EvalStage);
+    }
+
+    [Fact]
+    public void Optimize_ExecutionContextOverridesTimeRange()
+    {
+        var query = _parser.ParseBql("find * from last 24h");
+        var executionContext = new BqlExecutionContext
+        {
+            Query = "find * from last 24h",
+            StartTime = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+        };
+
+        var optimized = _optimizer.Optimize(query, executionContext);
+
+        optimized.StorageContext.StartTime.Should().Be(new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+    }
+
+    [Fact]
+    public void Optimize_AndWhereWithPushableFields_BothPushedDown()
+    {
+        var query = _parser.ParseBql("find * | where Severity >= 3 and host = \"web-01\"");
+        var optimized = _optimizer.Optimize(query);
+
+        // Both sides of AND should be pushed down
+        optimized.StorageContext.MinSeverity.Should().Be(LogSeverity.Warning);
+        optimized.StorageContext.Host.Should().Be("web-01");
+        optimized.RemainingStages.Should().NotContain(s => s is WhereStage);
+    }
+
+    [Fact]
+    public void Optimize_IndexFromExecutionContext_PropagatedToStorage()
+    {
+        var query = _parser.ParseBql("find errors");
+        var executionContext = new BqlExecutionContext
+        {
+            Query = "find errors",
+            Dataset = "app_main"
+        };
+        var optimized = _optimizer.Optimize(query, executionContext);
+
+        optimized.StorageContext.Index.Should().Be("app_main");
+    }
+
+    [Fact]
+    public void Optimize_HostFilter_PushedDown()
+    {
+        var query = _parser.ParseBql("find * | where host = \"server-1\"");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.StorageContext.Host.Should().Be("server-1");
+        optimized.RemainingStages.Should().NotContain(s => s is WhereStage);
+    }
+
+    [Fact]
+    public void Optimize_SourceTypeFilter_PushedDown()
+    {
+        var query = _parser.ParseBql("find * | where sourcetype = \"L4D2\"");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.StorageContext.SourceType.Should().Be("L4D2");
+        optimized.RemainingStages.Should().NotContain(s => s is WhereStage);
+    }
+
+    [Fact]
+    public void Optimize_SearchFieldEquals_BecomesFieldCondition()
+    {
+        var query = _parser.ParseBql("find status=200");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.StorageContext.SearchText.Should().BeNull();
+        optimized.RemainingStages.Should().ContainSingle(s => s is WhereStage);
+    }
+
+    [Fact]
+    public void Optimize_AndWithOrSameField_PushesOnlyTheSeverity()
+    {
+        var query = _parser.ParseBql("find * | where Severity >= 3 and (status = 200 or status = 500)");
+        var optimized = _optimizer.Optimize(query);
+
+        optimized.StorageContext.MinSeverity.Should().Be(LogSeverity.Warning);
+        optimized.StorageContext.FieldFilters.Should().BeNull();
+        optimized.RemainingStages.Should().ContainSingle(s => s is WhereStage);
+    }
+
+    [Theory]
+    [InlineData("find * | head 5 | where severity >= 4")]
+    [InlineData("find * | eval x = 1 | where severity >= 4")]
+    [InlineData("find * | stats count by host | where severity >= 4")]
+    public void Optimize_FilterAfterNonFilterStage_IsNotPushed(string bql)
+    {
+        var optimized = _optimizer.Optimize(_parser.ParseBql(bql));
+
+        optimized.StorageContext.MinSeverity.Should().BeNull();
+        optimized.RemainingStages.Should().Contain(s => s is WhereStage);
+    }
+
+    [Fact]
+    public void Optimize_SortOnOtherField_StaysInPipeline()
+    {
+        var optimized = _optimizer.Optimize(_parser.ParseBql("find * | sort by host asc"));
+
+        optimized.RemainingStages.Should().ContainSingle(s => s is SortStage);
+        optimized.StorageContext.SortField.Should().Be("Timestamp");
+    }
+
+}
