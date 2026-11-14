@@ -180,6 +180,21 @@ if (understanding.WillRun)
 
 Build the catalog from rows the caller may read. It never names anything they couldn't see.
 
+A host can give words their own meaning. `Conditions` maps a word or phrase to a BQL condition, which is ANDed into the query when a question uses it. `Rankings` maps a word to a field and a direction; the rows are sorted by that field, and a number before the word keeps that many. Both are empty in the shared vocabularies.
+
+```csharp
+var words = BqlVocabulary.CreateNeutral("modified");   // "modified yesterday" reads as a time
+words.Conditions["photos"] = "type like \"image/%\"";
+words.Conditions["pdfs"] = "ext = \"pdf\"";
+words.Conditions["duplicates"] = "copies > 1";
+words.Rankings["largest"] = ("size", true);
+words.Rankings["smallest"] = ("size", false);
+
+// "the 5 largest pdfs" reads as: find * | where (ext = "pdf") | sort by size desc | head 5
+```
+
+A ranking word followed by a field name, as in *largest folders*, is read as it was without it.
+
 `BqlVocabulary.Logs` reads log questions: hosts, levels, indexes, sourcetypes. `BqlVocabulary.Neutral` reads only what the words and the catalog say. Start from `CreateNeutral()` or `CreateLogs()` and add your own words.
 
 ## Threading

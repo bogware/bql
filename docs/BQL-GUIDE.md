@@ -55,6 +55,7 @@ The exact query depends on the data. Field names come from the catalog the host 
 | Most and least | *top 10 hosts*, *most common paths*, *busiest hosts*, *which host has the most errors*, *least common status codes*, *slowest endpoints*, *biggest responses* |
 | Columns and order | *show host, path and status*, *list hosts*, *unique ips*, *sorted by bytes*, *highest first*, *oldest first*, *latest 20*, *first 10* |
 | Text | *containing "connection refused"*, and any other words, which are searched for |
+| The host's own words (when its vocabulary has them) | *photos*, *pdfs*, *duplicates*, each standing for a condition; *largest*, *biggest*, *smallest*, each ranking by a field: *the 5 biggest photos*, *this week's pdfs*, *duplicates over 1 MB* |
 
 Fields have everyday names too. In the log vocabulary *server*, *machine* and *node* mean `host`, and *level* means `severity`. In any vocabulary *ip* and *client ip* mean `src_ip` or whichever your data has; *endpoint*, *url* and *page* mean `path`; *latency* and *response time* mean a duration field.
 

@@ -8,7 +8,7 @@ namespace Bogware.Bql.Natural;
 /// </summary>
 /// <remarks>
 /// <see cref="Neutral"/> and <see cref="Logs"/> are shared; don't change them. To adjust one,
-/// start from <see cref="CreateNeutral"/> or <see cref="CreateLogs"/> and change the copy.
+/// start from <see cref="CreateNeutral()"/> or <see cref="CreateLogs"/> and change the copy.
 /// </remarks>
 public sealed class BqlVocabulary
 {
@@ -22,9 +22,10 @@ public sealed class BqlVocabulary
     public static BqlVocabulary Logs { get; } = CreateLogs();
 
     /// <summary>A fresh neutral vocabulary to adjust.</summary>
-    public static BqlVocabulary CreateNeutral()
+    public static BqlVocabulary CreateNeutral() => Neutralize(new BqlVocabulary());
+
+    private static BqlVocabulary Neutralize(BqlVocabulary words)
     {
-        var words = new BqlVocabulary();
         words.Severities.Clear();
         foreach (var (spoken, stored) in words.FieldWords.ToList())
         {
@@ -35,6 +36,16 @@ public sealed class BqlVocabulary
         }
 
         return words;
+    }
+
+    /// <summary>
+    /// A fresh neutral vocabulary for rows that keep their time in <paramref name="timeField"/>,
+    /// so "modified yesterday" reads the field's name as part of the time.
+    /// </summary>
+    public static BqlVocabulary CreateNeutral(string timeField)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(timeField);
+        return Neutralize(new BqlVocabulary { TimeField = timeField });
     }
 
     /// <summary>A fresh log vocabulary to adjust.</summary>
@@ -164,6 +175,20 @@ public sealed class BqlVocabulary
         ["country"] = ["Country", "country"], ["countries"] = ["Country", "country"], ["city"] = ["City", "city"], ["cities"] = ["City", "city"],
         ["action"] = ["action"], ["actions"] = ["action"], ["event id"] = ["EventID", "event_id", "EventCode"], ["event ids"] = ["EventID", "event_id", "EventCode"],
     };
+
+    /// <summary>
+    /// Words or phrases that stand for a condition, with the condition as BQL: "photos" for
+    /// <c>type like "image/%"</c>, "duplicates" for <c>copies &gt; 1</c>. A question that uses one
+    /// keeps only rows that meet it, along with whatever else it asks. Empty unless the host adds some.
+    /// </summary>
+    public Dictionary<string, string> Conditions { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Words or phrases that rank rows by a field: "largest" for <c>("size", true)</c>, largest
+    /// first. "the 10 largest pdfs" sorts by the field and keeps the number given. A word followed
+    /// by a field name ("largest folders") is read as before. Empty unless the host adds some.
+    /// </summary>
+    public Dictionary<string, (string Field, bool Descending)> Rankings { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Words that start a comparison, longest first, with the operator they mean.</summary>
     public (string Phrase, string Op)[] Comparisons { get; } =
@@ -295,6 +320,7 @@ public sealed class BqlVocabulary
         foreach (var word in Severities.Keys.Concat(FieldWords.Keys).Concat(Aggregates.Keys).Concat(CountWords).Concat(GroupWords).Concat(OverTime)
                      .Concat(Spans.Keys).Concat(Units.Keys).Concat(Recent).Concat(Newest).Concat(Oldest).Concat(MostCommon).Concat(LeastCommon)
                      .Concat(SortWords).Concat(Directions.Keys).Concat(Weekdays.Keys).Concat(Comparisons.Select(c => c.Phrase))
+                     .Concat(Conditions.Keys).Concat(Rankings.Keys)
                      .Concat(["today", "yesterday", "since", "until", "before", "after", "between", "ago", "this", "week", "month", "year", "hours", "minutes", "days"]))
         {
             AddPhrase(word);

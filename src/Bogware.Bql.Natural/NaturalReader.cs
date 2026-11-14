@@ -118,6 +118,8 @@ public sealed partial class NaturalReader
         public NaturalReading Run()
         {
             CorrectTypos();
+            ReadNamedConditions();
+            ReadRankings();
             ReadStatusAndPaths();
             ReadTimes();
             ReadOverTime();
@@ -310,6 +312,102 @@ public sealed partial class NaturalReader
             return candidates[0];
         }
 
+        // ─── Words a host gave meanings: "photos", "largest" ────
+
+        /// <summary>A vocabulary's phrases, lower case with single spaces, to look up what they mean.</summary>
+        private static Dictionary<string, T> Phrases<T>(Dictionary<string, T> words)
+        {
+            var phrases = new Dictionary<string, T>(StringComparer.Ordinal);
+            foreach (var (phrase, meaning) in words)
+            {
+                var spaced = string.Join(' ', phrase.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                if (spaced.Length > 0)
+                {
+                    phrases.TryAdd(spaced, meaning);
+                }
+            }
+
+            return phrases;
+        }
+
+        /// <summary>"photos", "pdfs", "not duplicates": a condition the host named, ANDed with the rest.</summary>
+        private void ReadNamedConditions()
+        {
+            if (_w.Conditions.Count == 0)
+            {
+                return;
+            }
+
+            var phrases = Phrases(_w.Conditions);
+            for (var i = 0; i < _t.Count; i++)
+            {
+                if (At(i) is not { Kind: Kind.Word or Kind.Number })
+                {
+                    continue;
+                }
+
+                var (phrase, length) = Longest(i, phrases.Keys);
+                if (phrase == null)
+                {
+                    continue;
+                }
+
+                var condition = new ConditionRequest(phrase, "bql", [phrases[phrase]]);
+                var negated = At(i - 1)?.Lower is "not" or "no" or "without" or "excluding" or "except";
+                if (negated)
+                {
+                    Use(i - 1);
+                }
+
+                _r.Conditions.Add(negated ? condition.Negate() : condition);
+                Use(i, length);
+                i += length - 1;
+            }
+        }
+
+        /// <summary>"largest pdfs", "the 5 biggest photos": rows sorted by the field a host's word ranks by.</summary>
+        private void ReadRankings()
+        {
+            if (_w.Rankings.Count == 0)
+            {
+                return;
+            }
+
+            var phrases = Phrases(_w.Rankings);
+            for (var i = 0; i < _t.Count; i++)
+            {
+                if (At(i) is not { Kind: Kind.Word })
+                {
+                    continue;
+                }
+
+                var (phrase, length) = Longest(i, phrases.Keys);
+
+                // "largest folders" and "biggest size" name a field: ranked groups and measures, as before
+                if (phrase == null || FieldAt(i + length) != null)
+                {
+                    continue;
+                }
+
+                var (field, descending) = phrases[phrase];
+                var start = i;
+                if (At(i - 1) is { Kind: Kind.Number } or { Kind: Kind.Word, Lower: not ("a" or "an") } && Number(i - 1) is > 0 and var count)
+                {
+                    _r.Limit = count;
+                    start = i - 1;
+                }
+
+                if (At(start - 1)?.Lower is "top" or "the")
+                {
+                    start--;
+                }
+
+                _r.Sort = new SortRequest(field, descending);
+                Use(start, i - start + length);
+                i += length - 1;
+            }
+        }
+
         // ─── Status codes and paths: "404s", "5xx", "/api/orders" ─
 
         [GeneratedRegex(@"^(?<code>[1-5]\d\d)s$|^(?<class>[1-5])xx$", RegexOptions.IgnoreCase, 1000)]
@@ -365,6 +463,14 @@ public sealed partial class NaturalReader
 
         private static readonly string[] TimePrepositions = ["in", "within", "during", "over", "for", "from", "on", "the", "of"];
 
+        /// <summary>Words before a time that belong to it: prepositions, and the time field's own name, as in "modified yesterday".</summary>
+        private string[] TimeWords => _timeWords ??= [.. TimePrepositions, _w.TimeField.ToLowerInvariant()];
+
+        private string[]? _timeWords;
+
+        /// <summary>"week's" as "week", so "this week's pdfs" and "today's errors" read as times.</summary>
+        private static string WithoutPossessive(string lower) => lower.EndsWith("'s", StringComparison.Ordinal) ? lower[..^2] : lower;
+
         private void ReadTimes()
         {
             for (var i = 0; i < _t.Count; i++)
@@ -378,7 +484,7 @@ public sealed partial class NaturalReader
                 if (_w.Recent.Contains(token.Lower) && ReadSpan(i + 1) is { } span)
                 {
                     _r.Earliest = $"-{span.Amount}{span.Unit}";
-                    UseBefore(i, TimePrepositions);
+                    UseBefore(i, TimeWords);
                     Use(i, 1 + span.Length);
                     continue;
                 }
@@ -406,7 +512,7 @@ public sealed partial class NaturalReader
                     continue;
                 }
 
-                switch (token.Lower)
+                switch (WithoutPossessive(token.Lower))
                 {
                     case "today":
                         SetDay("@d", null, i);
@@ -430,10 +536,10 @@ public sealed partial class NaturalReader
                 }
 
                 // "this week", "this month", "this year"
-                if (token.Lower == "this" && At(i + 1) is { } period && period.Lower is "week" or "month" or "year" or "hour")
+                if (token.Lower == "this" && At(i + 1) is { } period && WithoutPossessive(period.Lower) is var unit && unit is "week" or "month" or "year" or "hour")
                 {
-                    _r.Earliest = "@" + (period.Lower switch { "week" => "w", "month" => "M", "year" => "y", _ => "h" });
-                    UseBefore(i, TimePrepositions);
+                    _r.Earliest = "@" + (unit switch { "week" => "w", "month" => "M", "year" => "y", _ => "h" });
+                    UseBefore(i, TimeWords);
                     Use(i, 2);
                     continue;
                 }
@@ -441,6 +547,7 @@ public sealed partial class NaturalReader
                 // "since monday", "since 10am", "since 2026-11-01", "before 3pm", "until yesterday"
                 if (token.Lower is "since" or "after" or "until" or "before" or "till" && TimeAt(i + 1) is { } moment)
                 {
+                    UseBefore(i, _w.TimeField.ToLowerInvariant());
                     if (token.Lower is "since" or "after")
                     {
                         _r.Earliest = moment.Spec;
@@ -477,7 +584,7 @@ public sealed partial class NaturalReader
         {
             _r.Earliest = earliest;
             _r.Latest = latest;
-            UseBefore(i, TimePrepositions);
+            UseBefore(i, TimeWords);
             Use(i);
         }
 
@@ -520,7 +627,7 @@ public sealed partial class NaturalReader
                 return ("@d", 1);
             }
 
-            if (token.Lower == "yesterday")
+            if (WithoutPossessive(token.Lower) == "yesterday")
             {
                 return ("-1d@d", 1);
             }
@@ -2177,6 +2284,8 @@ public sealed record ConditionRequest(string Field, string Op, IReadOnlyList<str
             "contains" => "not contains",
             "starts" => "not starts",
             "ends" => "not ends",
+            "bql" => "not bql",
+            "not bql" => "bql",
             _ => Op,
         },
     };
@@ -2189,6 +2298,8 @@ public sealed record ConditionRequest(string Field, string Op, IReadOnlyList<str
     public string ToBql() => Op switch
     {
         _ when IsLevel => $"{Field} {Op} {Values[0]}",
+        "bql" => $"({Values[0]})",
+        "not bql" => $"NOT ({Values[0]})",
         "in" => $"{Field} in ({string.Join(", ", Values.Select(Literal))})",
         "not in" => $"NOT {Field} in ({string.Join(", ", Values.Select(Literal))})",
         "contains" => $"{Field} like \"%{Like(Values[0])}%\"",
@@ -2204,6 +2315,8 @@ public sealed record ConditionRequest(string Field, string Op, IReadOnlyList<str
 
     public string Describe() => Op switch
     {
+        "bql" => Values[0],
+        "not bql" => $"not {Values[0]}",
         "in" => $"{Field} is {string.Join(" or ", Values)}",
         "not in" => $"{Field} isn't {string.Join(" or ", Values)}",
         "contains" => $"{Field} contains {Values[0]}",

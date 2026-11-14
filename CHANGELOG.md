@@ -18,6 +18,12 @@ All notable changes to this project are written here. The format follows
 - Relative time literals in expressions: `where modified >= -7d`, `-1d@d`, `@w`, `+1h`. They are
   times from when the query is read, as `earliest=` reads them. A sign or a snap is required, so
   `x - 7` and `a-b` are arithmetic as before. Search text still reads both as text, as SPL does.
+- Natural: `BqlVocabulary.Conditions`, words that stand for a BQL condition ("photos",
+  "duplicates"), and `BqlVocabulary.Rankings`, words that sort by a field ("largest",
+  "smallest"). Both are empty by default, so the log and neutral vocabularies read as before.
+- Natural: `BqlVocabulary.CreateNeutral(timeField)`. The time field's name before a time,
+  as in "modified yesterday", is read as part of the time. "this week's" and "today's" read as
+  times.
 
 ## [0.1.0] - 2026-11-14
 
