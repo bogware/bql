@@ -573,6 +573,163 @@ public class BqlLanguageTests : IAsyncLifetime
             .Should().Be(expected);
     }
 
+    // ─── Sizes and relative times ───
+
+    [Theory]
+    [InlineData("10B", 10L)]
+    [InlineData("10b", 10L)]
+    [InlineData("1KB", 1024L)]
+    [InlineData("1kb", 1024L)]
+    [InlineData("1KiB", 1024L)]
+    [InlineData("1kib", 1024L)]
+    [InlineData("1.5MB", 1572864L)]
+    [InlineData("1MiB", 1048576L)]
+    [InlineData("2GB", 2147483648L)]
+    [InlineData("2GiB", 2147483648L)]
+    [InlineData("1TB", 1099511627776L)]
+    [InlineData("1TiB", 1099511627776L)]
+    [InlineData("1PB", 1125899906842624L)]
+    [InlineData("8191PB", 9222246136947933184L)]
+    [InlineData("0KB", 0L)]
+    public async Task Sizes_AreBytes(string literal, long bytes)
+    {
+        (await Eval(literal)).Should().Be(bytes);
+    }
+
+    [Fact]
+    public async Task Size_WithAFractionOfAByte_KeepsIt()
+    {
+        (await Eval("0.5KB")).Should().Be(512L);
+        (await Eval("0.1KB")).Should().Be(102.4);
+    }
+
+    [Theory]
+    [InlineData("find * | where bytes > 0.25KB", 2)]
+    [InlineData("find * | where bytes <= 300b", 3)]
+    [InlineData("find * | where bytes < 1MB", 4)]
+    [InlineData("find * | where bytes in (100B, 300b)", 2)]
+    [InlineData("find * | eval kb = bytes / 1KB | where kb > 0.25", 2)]
+    public async Task Sizes_CompareAsNumbers(string query, int expected)
+    {
+        (await Run(query)).Should().HaveCount(expected);
+    }
+
+    [Theory]
+    [InlineData("| makeresults | eval x = 8192PB")]
+    [InlineData("| makeresults | eval x = 9007199254740993TB")]
+    [InlineData("| makeresults | eval x = 99999999999999999999999999999999999999KB")]
+    [InlineData("| makeresults | eval x = 10 MB")]
+    [InlineData("| makeresults | eval x = 10XB")]
+    public async Task Sizes_TooLargeOrMalformed_AreParseErrors(string query)
+    {
+        var act = () => Run(query);
+
+        (await act.Should().ThrowAsync<BqlParseException>()).Which.GetType().Should().Be<BqlParseException>();
+    }
+
+    [Theory]
+    [InlineData("search bytes>10MB")]
+    [InlineData("search modified>=-7d")]
+    [InlineData("search modified>=@d")]
+    public void UnitsInSearchText_StayText(string query)
+    {
+        // SPL reads a bare value in search text as text, so these stay searches as they were
+        var optimized = new BqlOptimizer().Optimize(new BqlParser().ParseBql(query));
+
+        optimized.RemainingStages.Should().ContainSingle().Which.Should().BeOfType<SearchStage>();
+    }
+
+    [Theory]
+    [InlineData("-7d", -7 * 24 * 3600)]
+    [InlineData("-24h", -24 * 3600)]
+    [InlineData("+1h", 3600)]
+    [InlineData("-30m", -30 * 60)]
+    [InlineData("-90s", -90)]
+    [InlineData("-2w", -14 * 24 * 3600)]
+    public async Task RelativeTimes_AreTimesFromNow(string literal, int seconds)
+    {
+        var before = DateTime.UtcNow;
+        var value = await Eval(literal);
+        var after = DateTime.UtcNow;
+
+        var time = value.Should().BeOfType<DateTime>().Subject;
+        time.Kind.Should().Be(DateTimeKind.Utc);
+        time.Should().BeOnOrAfter(before.AddSeconds(seconds)).And.BeOnOrBefore(after.AddSeconds(seconds));
+    }
+
+    [Theory]
+    [InlineData("-1d@d")]
+    [InlineData("@d")]
+    [InlineData("@w")]
+    [InlineData("-1M")]
+    [InlineData("-1y@y")]
+    [InlineData("@h")]
+    public async Task RelativeTimes_SnapAsEarliestDoes(string literal)
+    {
+        var value = (DateTime)(await Eval(literal))!;
+
+        // The same spec, applied as earliest= applies it, within the same second
+        var expected = BqlTimeOf(literal);
+        (value - expected).Duration().Should().BeLessThan(TimeSpan.FromMinutes(1));
+    }
+
+    private static DateTime BqlTimeOf(string spec)
+    {
+        var parsed = new BqlParser().ParseBql($"find * earliest={spec}");
+        return parsed.TimeRange!.Start!.Value;
+    }
+
+    [Theory]
+    [InlineData("| makeresults | where _time >= -1h", 1)]
+    [InlineData("| makeresults | where _time > +1h", 0)]
+    [InlineData("| makeresults | where _time >= @d and _time < +1d@d", 1)]
+    [InlineData("| makeresults | where -1h <= _time", 1)]
+    [InlineData("| makeresults | eval old = \"2026-01-01T00:00:00Z\" | where old < -1d", 1)]
+    [InlineData("| makeresults | eval old = \"2026-01-01T00:00:00Z\" | where old >= -1d", 0)]
+    [InlineData("| makeresults | eval epoch = now() | where epoch >= -1m", 1)]
+    public async Task RelativeTimes_CompareAsTimes(string query, int expected)
+    {
+        (await Run(query)).Should().HaveCount(expected);
+    }
+
+    [Theory]
+    [InlineData("10 - 7", 3.0)]
+    [InlineData("10 -7", 3.0)]
+    [InlineData("10-7", 3.0)]
+    [InlineData("2 * -7", -14.0)]
+    [InlineData("-7", -7.0)]
+    [InlineData("- 7", -7.0)]
+    public async Task Arithmetic_StillReadsAsBefore(string expression, double expected)
+    {
+        Convert.ToDouble(await Eval(expression), CultureInfo.InvariantCulture).Should().Be(expected);
+    }
+
+    [Fact]
+    public async Task FieldMinusField_IsArithmetic()
+    {
+        var rows = await Run("| makeresults | eval a = 10, b = 3, d = 1, c = a-b, e = a - d, f = a-d");
+
+        Convert.ToDouble(rows.Single()["c"], CultureInfo.InvariantCulture).Should().Be(7);
+        Convert.ToDouble(rows.Single()["e"], CultureInfo.InvariantCulture).Should().Be(9);
+        Convert.ToDouble(rows.Single()["f"], CultureInfo.InvariantCulture).Should().Be(9);
+    }
+
+    [Theory]
+    [InlineData("| makeresults | eval x = 7d")]
+    [InlineData("| makeresults | eval x = 1 -7d")]
+    [InlineData("| makeresults | eval x = 1-7d")]
+    [InlineData("| makeresults | eval x = - 7d")]
+    [InlineData("| makeresults | eval x = -7d@dd")]
+    [InlineData("| makeresults | eval x = -7days")]
+    [InlineData("| makeresults | eval x = -99999999999d")]
+    [InlineData("| makeresults | eval x = -999999y")]
+    public async Task RelativeTimes_NeedASignOrSnap_AndARange(string query)
+    {
+        var act = () => Run(query);
+
+        (await act.Should().ThrowAsync<BqlParseException>()).Which.GetType().Should().Be<BqlParseException>();
+    }
+
     // ─── Natural language ───
 
     [Fact]

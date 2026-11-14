@@ -10,6 +10,11 @@ All notable changes to this project are written here. The format follows
 
 - `BqlComparison.Holds(op, value, literal)`: the engine's comparison, for a source that applies
   predicates itself. It is the code `where` runs, so the two can't differ.
+- Size literals in expressions: `where size > 10MB`. `B`, `KB`, `MB`, `GB`, `TB`, `PB` and
+  `KiB` to `PiB`, counted in 1024s, any case. A size too large to hold is a parse error.
+- Relative time literals in expressions: `where modified >= -7d`, `-1d@d`, `@w`, `+1h`. They are
+  times from when the query is read, as `earliest=` reads them. A sign or a snap is required, so
+  `x - 7` and `a-b` are arithmetic as before. Search text still reads both as text, as SPL does.
 
 ## [0.1.0] - 2026-11-14
 

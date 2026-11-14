@@ -34,6 +34,7 @@ public sealed class BqlOptimizer
     private readonly BqlSchema _schema;
     private readonly BqlSourceCapabilities _capabilities;
     private readonly BqlParser _parser;
+    private readonly BqlParser _searchConditionParser;
 
     /// <summary>An optimizer for a source with this schema and these capabilities.</summary>
     public BqlOptimizer(BqlSchema? schema = null, BqlSourceCapabilities? capabilities = null, BqlParser? parser = null)
@@ -41,6 +42,7 @@ public sealed class BqlOptimizer
         _schema = schema ?? BqlSchema.Default;
         _capabilities = capabilities ?? BqlSourceCapabilities.None;
         _parser = parser ?? new BqlParser(_schema);
+        _searchConditionParser = _parser.WithoutUnitLiterals();
     }
 
     /// <summary>
@@ -212,7 +214,8 @@ public sealed class BqlOptimizer
 
         try
         {
-            var parsed = _parser.ParseBql($"* | where {condition}");
+            // Bare values in search text are text, so 10MB and -7d stay as written
+            var parsed = _searchConditionParser.ParseBql($"* | where {condition}");
             return parsed.Stages.OfType<WhereStage>().LastOrDefault() ?? stage;
         }
         catch (BqlParseException)

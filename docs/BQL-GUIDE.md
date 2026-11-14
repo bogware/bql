@@ -137,6 +137,23 @@ find * | where NOT source_type = "debug"
 
 Text compares without regard to case. A field the schema gives named levels accepts the names: with the log schema, `severity >= warning`. A time field compared with a date string compares as times.
 
+#### Sizes and relative times
+
+```
+find * | where bytes > 10MB
+find * | where bytes >= 1.5KiB and bytes < 2GB
+find * | eval kb = bytes / 1KB
+find * | where _time >= -7d
+find * | where _time >= -1d@d and _time < @d
+find * | where _time < +1h
+```
+
+A number written right against a size unit is that many bytes. The units are `B`, `KB`, `MB`, `GB`, `TB` and `PB`, and the same with an `i`: `KiB`, `MiB`, `GiB`, `TiB`, `PiB`. They count in 1024s, as Windows shows file sizes, so `1KB` and `1KiB` are both 1,024 bytes and `1.5MB` is 1,572,864. Case doesn't matter. `10 MB`, with a space, is not a size, and a size of more than BQL can hold (about 8,000 PB) is an error.
+
+A relative time is a time counted back or forward from when the query is read, as `earliest=` counts it. `-7d` is seven days ago, `+1h` an hour from now, and `@` snaps down to the start of a unit: `@d` is midnight today, `-1d@d` midnight yesterday, `@w` the start of the week. The units are `s`, `m`, `h`, `d`, `w`, `M` (months) and `y`. It needs a sign or a snap, so `7d` alone is not one. It stands alone where a value goes: `x - 7` and `a-b` are arithmetic as always, and `now() - 7d` is an error. Times are UTC.
+
+In search text, as in SPL, bare values are text: `search bytes>10MB` compares `bytes` with the text `10MB`. Use `where` for sizes and times.
+
 #### `regex` — Filter by regex pattern
 
 ```

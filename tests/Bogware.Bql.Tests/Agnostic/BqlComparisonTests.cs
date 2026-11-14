@@ -51,6 +51,7 @@ public sealed class BqlComparisonTests
     [
         "5", "5.0", "5.0000000001", "4.9", "0", "\"5\"", "\"abc\"", "\"ABC\"", "\"b\"", "\"\"",
         "\"2026-03-01\"", "\"2026-03-01T00:00:00Z\"", "1772323200", "true", "false", "null", "\"x\"", "9",
+        "5B", "0.004KB", "-7d", "@d", "-1y@y",
     ];
 
     // The parser has no ==; Holds takes it as =, as BqlPredicate does

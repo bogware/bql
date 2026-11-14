@@ -13,6 +13,9 @@ public sealed class BqlParser
 {
     private readonly BqlSchema _schema;
     private readonly BqlParserLimits _limits;
+
+    // False when parsing a condition rewritten from search text, where SPL reads 10MB and -7d as text
+    private readonly bool _unitLiterals;
     private List<BqlToken> _tokens = new();
     private string _source = string.Empty;
     private int _pos;
@@ -20,10 +23,23 @@ public sealed class BqlParser
 
     /// <summary>A parser for rows of the given schema, which names ordered fields such as a severity.</summary>
     public BqlParser(BqlSchema? schema = null, BqlParserLimits? limits = null)
+        : this(schema ?? BqlSchema.Default, limits ?? new BqlParserLimits(), unitLiterals: true)
     {
-        _schema = schema ?? BqlSchema.Default;
-        _limits = limits ?? new BqlParserLimits();
     }
+
+    private BqlParser(BqlSchema schema, BqlParserLimits limits, bool unitLiterals)
+    {
+        _schema = schema;
+        _limits = limits;
+        _unitLiterals = unitLiterals;
+    }
+
+    /// <summary>
+    /// A parser that reads sizes such as <c>10MB</c> and relative times such as <c>-7d</c> as
+    /// they were before, which is to say not at all. The optimizer uses it for conditions written
+    /// in search text, whose bare values SPL reads as text.
+    /// </summary>
+    internal BqlParser WithoutUnitLiterals() => new(_schema, _limits, unitLiterals: false);
 
     /// <summary>The schema this parser reads level names with.</summary>
     public BqlSchema Schema => _schema;
@@ -44,7 +60,7 @@ public sealed class BqlParser
     {
         try
         {
-            return new BqlParser(_schema, _limits).ParseBqlCore(query);
+            return new BqlParser(_schema, _limits, _unitLiterals).ParseBqlCore(query);
         }
         catch (Exception ex) when (ex is not BqlParseException && !BqlFailures.PassesThrough(ex))
         {
@@ -424,6 +440,11 @@ public sealed class BqlParser
 
     private BqlExpression ParseUnary()
     {
+        if (RelativeTimeLiteral() is { } relative)
+        {
+            return relative;
+        }
+
         if (Current.Kind == BqlTokenKind.Minus)
         {
             Advance();
@@ -432,6 +453,64 @@ public sealed class BqlParser
         }
 
         return ParsePrimary();
+    }
+
+    // A fixed, anchored pattern with no nested repetition; the timeout only guards
+    private static readonly Regex RelativeTime = new(
+        @"\G(?:[+-]\d+[smhdwMy](?:@[smhdwMy])?|@[smhdwMy])(?![\w@])",
+        RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(1));
+
+    /// <summary>
+    /// <c>-7d</c>, <c>+1h</c>, <c>-1d@d</c> or <c>@w</c> where an operand starts: a time, from now
+    /// when the query is parsed, as <c>earliest=</c> reads it. A sign or a snap is required, so
+    /// <c>7d</c> alone is not one, and <c>x - 7</c> and <c>x-7d</c> are arithmetic as before.
+    /// </summary>
+    private LiteralExpression? RelativeTimeLiteral()
+    {
+        if (!_unitLiterals || Current.Kind is not (BqlTokenKind.Minus or BqlTokenKind.Plus or BqlTokenKind.Symbol)
+            || Current.Position < 0 || RelativeTime.Match(_source, Current.Position) is not { Success: true } match)
+        {
+            return null;
+        }
+
+        var at = Current.Position;
+        var end = match.Index + match.Length;
+        var time = BqlTime.ApplyRelative(DateTime.UtcNow, match.Value)
+            ?? throw new BqlParseException($"'{match.Value}' is outside the times BQL can hold", $"position {at}");
+
+        while (Current.Kind != BqlTokenKind.Eof && Current.Position < end)
+        {
+            Advance();
+        }
+
+        return new LiteralExpression(time);
+    }
+
+    /// <summary>
+    /// A number written right against a size unit, as in <c>10MB</c>, is that many bytes. Units
+    /// count in 1024s, as file managers on Windows show sizes. Null when no unit follows.
+    /// </summary>
+    private LiteralExpression? SizeLiteral(string number, int at)
+    {
+        if (!_unitLiterals || Current.Kind != BqlTokenKind.Identifier || Current.Position != at + number.Length
+            || !BqlSizes.TryGetMultiplier(Current.Value, out var multiplier))
+        {
+            return null;
+        }
+
+        var unit = Current.Value;
+        Advance();
+        if (!decimal.TryParse(number, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var amount)
+            || amount > long.MaxValue / (decimal)multiplier)
+        {
+            throw new BqlParseException($"'{number}{unit}' is more bytes than BQL can hold", $"position {at}");
+        }
+
+        var bytes = amount * multiplier;
+        return bytes == decimal.Truncate(bytes)
+            ? new LiteralExpression((long)bytes)
+            : new LiteralExpression((double)bytes);
     }
 
     private BqlExpression Bounded(BqlExpression expression) =>
@@ -467,12 +546,23 @@ public sealed class BqlParser
             return new LiteralExpression(val);
         }
 
+        // A relative time after an operator that isn't arithmetic, as in IN (-1d@d, @d)
+        if (RelativeTimeLiteral() is { } relative)
+        {
+            return relative;
+        }
+
         // Number literal
         if (Current.Kind == BqlTokenKind.NumberLiteral)
         {
             var val = Current.Value;
             var at = Current.Position;
             Advance();
+            if (SizeLiteral(val, at) is { } size)
+            {
+                return size;
+            }
+
             if (val.Contains('.'))
             {
                 return double.TryParse(val, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var real) && double.IsFinite(real)
