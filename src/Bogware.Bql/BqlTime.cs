@@ -156,17 +156,25 @@ internal static class BqlTime
             }
         }
 
-        return match.Groups["snap"].Value switch
+        try
         {
-            "s" => new DateTime(result.Year, result.Month, result.Day, result.Hour, result.Minute, result.Second, DateTimeKind.Utc),
-            "m" => new DateTime(result.Year, result.Month, result.Day, result.Hour, result.Minute, 0, DateTimeKind.Utc),
-            "h" => new DateTime(result.Year, result.Month, result.Day, result.Hour, 0, 0, DateTimeKind.Utc),
-            "d" => result.Date,
-            "w" => result.Date.AddDays(-(int)result.DayOfWeek),
-            "M" => new DateTime(result.Year, result.Month, 1, 0, 0, 0, DateTimeKind.Utc),
-            "y" => new DateTime(result.Year, 1, 1, 0, 0, 0, DateTimeKind.Utc),
-            _ => result,
-        };
+            return match.Groups["snap"].Value switch
+            {
+                "s" => new DateTime(result.Year, result.Month, result.Day, result.Hour, result.Minute, result.Second, DateTimeKind.Utc),
+                "m" => new DateTime(result.Year, result.Month, result.Day, result.Hour, result.Minute, 0, DateTimeKind.Utc),
+                "h" => new DateTime(result.Year, result.Month, result.Day, result.Hour, 0, 0, DateTimeKind.Utc),
+                "d" => result.Date,
+                "w" => result.Date.AddDays(-(int)result.DayOfWeek),
+                "M" => new DateTime(result.Year, result.Month, 1, 0, 0, 0, DateTimeKind.Utc),
+                "y" => new DateTime(result.Year, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                _ => result,
+            };
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            // Snapping a date near the start of the calendar back past it
+            return null;
+        }
     }
 
     private static string? DotNetFormat(char token) => token switch

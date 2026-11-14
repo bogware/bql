@@ -66,8 +66,9 @@ public sealed class BqlLexer
         if (ch is '"' or '\'')
             return ReadString(ch);
 
-        // Numbers (may be followed by time unit → TimeSpanLiteral)
-        if (char.IsDigit(ch))
+        // Numbers (may be followed by time unit → TimeSpanLiteral). ASCII digits only: other
+        // scripts' digits are letters to the parser, never numbers it would fail to convert.
+        if (char.IsAsciiDigit(ch))
             return ReadNumberOrTimeSpan();
 
         // Identifiers, keywords, and named levels
@@ -162,13 +163,13 @@ public sealed class BqlLexer
         var sb = new StringBuilder();
         var hasDecimal = false;
 
-        while (_pos < _input.Length && (char.IsDigit(_input[_pos]) || _input[_pos] == '.'))
+        while (_pos < _input.Length && (char.IsAsciiDigit(_input[_pos]) || _input[_pos] == '.'))
         {
             if (_input[_pos] == '.')
             {
                 if (hasDecimal) break; // second dot, stop
                 // Check if next char is digit (decimal) vs field access
-                if (_pos + 1 >= _input.Length || !char.IsDigit(_input[_pos + 1])) break;
+                if (_pos + 1 >= _input.Length || !char.IsAsciiDigit(_input[_pos + 1])) break;
                 hasDecimal = true;
             }
             sb.Append(_input[_pos]);

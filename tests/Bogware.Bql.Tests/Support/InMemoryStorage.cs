@@ -163,11 +163,20 @@ public sealed class InMemoryKnowledgeStorage : IBqlKnowledgeProvider
         return Task.CompletedTask;
     }
 
-    public Task<BqlLookupTable?> GetLookupAsync(string name, CancellationToken cancellationToken = default) =>
-        Task.FromResult(_lookups.TryGetValue(name, out var lookup) ? lookup : null);
+    /// <summary>The caller each lookup and macro was asked for, most recent last.</summary>
+    public ConcurrentQueue<BqlCaller> Callers { get; } = new();
 
-    public Task<BqlMacro?> GetMacroAsync(string name, CancellationToken cancellationToken = default) =>
-        Task.FromResult(_macros.TryGetValue(name, out var macro) ? macro : null);
+    public Task<BqlLookupTable?> GetLookupAsync(string name, BqlCaller caller, CancellationToken cancellationToken = default)
+    {
+        Callers.Enqueue(caller);
+        return Task.FromResult(_lookups.TryGetValue(name, out var lookup) ? lookup : null);
+    }
+
+    public Task<BqlMacro?> GetMacroAsync(string name, BqlCaller caller, CancellationToken cancellationToken = default)
+    {
+        Callers.Enqueue(caller);
+        return Task.FromResult(_macros.TryGetValue(name, out var macro) ? macro : null);
+    }
 }
 
 /// <summary>Cabinet's lookup table shape, as the ported tests write them.</summary>

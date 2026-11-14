@@ -12,7 +12,7 @@ internal sealed class LegacySearchOperator : BqlOperator
     private readonly BqlTextSearch _search;
     public override string Name => "search";
 
-    public LegacySearchOperator(string pattern) { _search = BqlTextSearch.Parse(pattern); }
+    public LegacySearchOperator(string pattern, int maxDepth) { _search = BqlTextSearch.Parse(pattern, maxDepth); }
 
     public override Task<IEnumerable<dynamic>> ExecuteAsync(IEnumerable<dynamic> input, CancellationToken ct = default) =>
         Task.FromResult<IEnumerable<dynamic>>(((IEnumerable<object>)input).Where(evt => _search.Matches((IDictionary<string, object?>)evt, Schema)));
@@ -91,30 +91,47 @@ internal sealed class LegacySortOperator : BqlOperator
     public LegacySortOperator(List<SortField> fields) { _fields = fields; }
 
     public override Task<IEnumerable<dynamic>> ExecuteAsync(IEnumerable<dynamic> input, CancellationToken ct = default) =>
-        Task.FromResult(Order(input));
+        Task.FromResult(Order(input, ct));
 
-    /// <summary>Orders rows. Rows that compare equal keep their order.</summary>
-    internal IEnumerable<dynamic> Order(IEnumerable<dynamic> input)
+    /// <summary>Orders rows. Rows that compare equal keep their order. Long sorts stop when the query's time is up.</summary>
+    internal IEnumerable<dynamic> Order(IEnumerable<dynamic> input, CancellationToken ct = default)
     {
         if (_fields.Count == 0)
         {
             return input;
         }
 
+        var comparer = new CancellingComparer(BqlValueComparer.Instance, ct);
         var first = _fields[0];
         var ordered = first.Descending
-            ? input.OrderByDescending<dynamic, object?>(e => GetSortValue(e, first.Field), BqlValueComparer.Instance)
-            : input.OrderBy<dynamic, object?>(e => GetSortValue(e, first.Field), BqlValueComparer.Instance);
+            ? input.OrderByDescending<dynamic, object?>(e => GetSortValue(e, first.Field), comparer)
+            : input.OrderBy<dynamic, object?>(e => GetSortValue(e, first.Field), comparer);
 
         for (var i = 1; i < _fields.Count; i++)
         {
             var f = _fields[i];
             ordered = f.Descending
-                ? ordered.ThenByDescending<dynamic, object?>(e => GetSortValue(e, f.Field), BqlValueComparer.Instance)
-                : ordered.ThenBy<dynamic, object?>(e => GetSortValue(e, f.Field), BqlValueComparer.Instance);
+                ? ordered.ThenByDescending<dynamic, object?>(e => GetSortValue(e, f.Field), comparer)
+                : ordered.ThenBy<dynamic, object?>(e => GetSortValue(e, f.Field), comparer);
         }
 
         return ordered;
+    }
+
+    /// <summary>Checks for cancellation every so many comparisons, so a sort can't outlive its query.</summary>
+    private sealed class CancellingComparer(IComparer<object?> inner, CancellationToken ct) : IComparer<object?>
+    {
+        private int _count;
+
+        public int Compare(object? x, object? y)
+        {
+            if (++_count % CancellationCheckInterval == 0)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+
+            return inner.Compare(x, y);
+        }
     }
 
     private static object? GetSortValue(object evt, string field)
@@ -289,7 +306,7 @@ internal sealed class LegacyRexOperator : BqlOperator
     public override Task<IEnumerable<dynamic>> ExecuteAsync(IEnumerable<dynamic> input, CancellationToken ct = default)
     {
         // Runs for each batch of a query, so compile once. The timeout guards against ReDoS.
-        _regex ??= new Regex(_pattern, RegexOptions.Compiled, RegexTimeoutTracker.PerEvent);
+        _regex ??= new Regex(_pattern, RegexOptions.Compiled, (Budget?.Limits ?? BqlScope.Limits).RegexTimeoutPerRow);
         _timeouts ??= new RegexTimeoutTracker(_pattern, Budget?.Limits ?? new BqlLimits());
         var regex = _regex;
         var timeouts = _timeouts;
@@ -435,6 +452,7 @@ internal sealed class LegacyTransactionOperator : BqlOperator
             return BqlGroupKey.For(dict, _fields);
         });
 
+        var checks = 0;
         foreach (var group in groups)
         {
             var orderedEvents = group
@@ -452,6 +470,11 @@ internal sealed class LegacyTransactionOperator : BqlOperator
 
             foreach (var item in orderedEvents)
             {
+                if (++checks % CancellationCheckInterval == 0)
+                {
+                    ct.ThrowIfCancellationRequested();
+                }
+
                 // With a start marker, events outside a transaction are dropped, and a new
                 // start marker begins a new transaction.
                 if (_startsWith != null)
@@ -559,6 +582,8 @@ internal sealed class LegacyEventStatsOperator : BqlOperator
     public override Task<IEnumerable<dynamic>> ExecuteAsync(IEnumerable<dynamic> input, CancellationToken ct = default)
     {
         var events = input.ToList();
+        var budget = Budget ?? BqlBudget.Unbounded();
+        ct.ThrowIfCancellationRequested();
 
         if (_groupByFields.Count == 0)
         {
@@ -567,7 +592,7 @@ internal sealed class LegacyEventStatsOperator : BqlOperator
             foreach (var agg in _aggregations)
             {
                 var key = agg.OutputName;
-                aggValues[key] = LegacyStatsOperator.ComputeAggregate(agg, events);
+                aggValues[key] = LegacyStatsOperator.ComputeAggregate(agg, events, budget);
             }
             foreach (var evt in events)
             {
@@ -585,14 +610,17 @@ internal sealed class LegacyEventStatsOperator : BqlOperator
                 return BqlGroupKey.For(dict, _groupByFields);
             });
 
+            var groupCount = 0;
             foreach (var group in groups)
             {
+                budget.CheckGroupCount(++groupCount);
+                ct.ThrowIfCancellationRequested();
                 var groupEvents = group.ToList();
                 var aggValues = new Dictionary<string, object?>();
                 foreach (var agg in _aggregations)
                 {
                     var key = agg.OutputName;
-                    aggValues[key] = LegacyStatsOperator.ComputeAggregate(agg, groupEvents);
+                    aggValues[key] = LegacyStatsOperator.ComputeAggregate(agg, groupEvents, budget);
                 }
                 foreach (var evt in groupEvents)
                 {
@@ -628,17 +656,30 @@ internal sealed class LegacyStreamStatsOperator : BqlOperator
     public override Task<IEnumerable<dynamic>> ExecuteAsync(IEnumerable<dynamic> input, CancellationToken ct = default)
     {
         var events = input.ToList();
+        var budget = Budget ?? BqlBudget.Unbounded();
+        if (_window > budget.Limits.MaxStreamStatsWindow)
+        {
+            throw new BqlLimitExceededException(
+                $"streamstats window={_window:N0} is wider than the most allowed, {budget.Limits.MaxStreamStatsWindow:N0}.");
+        }
+
+        var seen = 0;
         if (_window <= 0)
         {
             // Without a window, running totals: each row costs one update, not a pass over all before it
-            var budget = Budget ?? BqlBudget.Unbounded();
             var running = new Dictionary<string, AggregateAccumulator[]>(StringComparer.OrdinalIgnoreCase);
             foreach (var evt in events)
             {
+                if (++seen % CancellationCheckInterval == 0)
+                {
+                    ct.ThrowIfCancellationRequested();
+                }
+
                 var dict = (IDictionary<string, object?>)evt;
                 var groupKey = _groupByFields.Count > 0 ? BqlGroupKey.For(dict, _groupByFields) : "";
                 if (!running.TryGetValue(groupKey, out var accumulators))
                 {
+                    budget.CheckGroupCount(running.Count + 1);
                     accumulators = _aggregations.Select(agg => new AggregateAccumulator(agg, budget)).ToArray();
                     running[groupKey] = accumulators;
                 }
@@ -662,6 +703,12 @@ internal sealed class LegacyStreamStatsOperator : BqlOperator
 
         foreach (var evt in events)
         {
+            // Each row looks back over its window, so check often enough to honour the time limit
+            if (++seen % Math.Max(1, CancellationCheckInterval / _window) == 0)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+
             var dict = (IDictionary<string, object?>)evt;
             var groupKey = _groupByFields.Count > 0
                 ? BqlGroupKey.For(dict, _groupByFields)
@@ -669,6 +716,7 @@ internal sealed class LegacyStreamStatsOperator : BqlOperator
 
             if (!groupWindows.TryGetValue(groupKey, out var window))
             {
+                budget.CheckGroupCount(groupWindows.Count + 1);
                 window = new List<dynamic>();
                 groupWindows[groupKey] = window;
             }
@@ -686,7 +734,7 @@ internal sealed class LegacyStreamStatsOperator : BqlOperator
             foreach (var agg in _aggregations)
             {
                 var key = agg.OutputName;
-                dict[key] = LegacyStatsOperator.ComputeAggregate(agg, window);
+                dict[key] = LegacyStatsOperator.ComputeAggregate(agg, window, budget);
             }
         }
 
@@ -747,6 +795,12 @@ internal sealed class LegacyBucketOperator : BqlOperator
 
     public LegacyBucketOperator(string field, TimeSpan? span, double? numericSpan, string? alias)
     {
+        // A query built by a dialect skips the parser's check, so check again here
+        if (span <= TimeSpan.Zero || numericSpan is { } n && !(n > 0 && double.IsFinite(n)))
+        {
+            throw new BqlExecutionException("bin needs a span above zero");
+        }
+
         _field = field;
         _span = span;
         _numericSpan = numericSpan;
@@ -796,9 +850,17 @@ internal sealed class LegacyMakeResultsOperator : BqlOperator
     public override Task<IEnumerable<dynamic>> ExecuteAsync(IEnumerable<dynamic> input, CancellationToken ct = default)
     {
         // makeresults generates synthetic events, ignoring input
+        var budget = Budget ?? BqlBudget.Unbounded();
+        var count = _count;
+        if (count > budget.Limits.MaxMakeResults)
+        {
+            count = budget.Limits.MaxMakeResults;
+            budget.Truncated = true;
+        }
+
         var results = new List<dynamic>();
         var now = DateTime.UtcNow;
-        for (var i = 0; i < _count; i++)
+        for (var i = 0; i < count; i++)
         {
             var expando = NewRow();
             var dict = (IDictionary<string, object?>)expando;
@@ -825,9 +887,23 @@ internal sealed class LegacyMvExpandOperator : BqlOperator
 
     public override Task<IEnumerable<dynamic>> ExecuteAsync(IEnumerable<dynamic> input, CancellationToken ct = default)
     {
+        // Every value becomes a row, so the output is held to MaxRowsInMemory like any stage that keeps rows
+        var budget = Budget ?? BqlBudget.Unbounded();
+        var maxRows = budget.Limits.MaxRowsInMemory;
         var results = new List<dynamic>();
         foreach (var evt in input)
         {
+            if (results.Count >= maxRows)
+            {
+                budget.Truncated = true;
+                break;
+            }
+
+            if (results.Count % CancellationCheckInterval == 0)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+
             var count = 0;
             var dict = (IDictionary<string, object?>)evt;
             if (!dict.TryGetValue(_field, out var val) || val == null)
@@ -845,6 +921,12 @@ internal sealed class LegacyMvExpandOperator : BqlOperator
             foreach (var v in values)
             {
                 if (count++ >= _limit) break;
+                if (results.Count >= maxRows)
+                {
+                    budget.Truncated = true;
+                    break;
+                }
+
                 var newExpando = NewRow();
                 var newDict = (IDictionary<string, object?>)newExpando;
                 foreach (var kvp in dict) newDict[kvp.Key] = kvp.Value;
@@ -1045,7 +1127,7 @@ internal sealed class LegacyRegexOperator : BqlOperator
         // Runs for each batch of a query, so compile once.
         try
         {
-            _regex ??= new Regex(_pattern, RegexOptions.Compiled | RegexOptions.IgnoreCase, RegexTimeoutTracker.PerEvent);
+            _regex ??= new Regex(_pattern, RegexOptions.Compiled | RegexOptions.IgnoreCase, (Budget?.Limits ?? BqlScope.Limits).RegexTimeoutPerRow);
         }
         catch (ArgumentException ex)
         {
@@ -1096,9 +1178,17 @@ internal sealed class LegacyFieldSummaryOperator : BqlOperator
 
         // Collect stats per field
         var fieldStats = new Dictionary<string, FieldStatData>(StringComparer.OrdinalIgnoreCase);
+        var maxDistinct = (Budget?.Limits ?? BqlScope.Limits).MaxFieldSummaryValues;
+        var maxSamples = Math.Min(_maxValues, maxDistinct);
+        var seen = 0;
 
         foreach (var evt in events)
         {
+            if (++seen % CancellationCheckInterval == 0)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+
             var dict = (IDictionary<string, object?>)evt;
             foreach (var kvp in dict)
             {
@@ -1115,9 +1205,11 @@ internal sealed class LegacyFieldSummaryOperator : BqlOperator
                     stats.IsTime |= kvp.Value is DateTime;
                     var strVal = kvp.Value.ToString() ?? "";
                     // Cap distinct value tracking to prevent memory exhaustion
-                    if (stats.DistinctValues.Count < 100_000)
+                    if (stats.DistinctValues.Count < maxDistinct)
                         stats.DistinctValues.Add(strVal);
-                    if (stats.SampleValues.Count < _maxValues && !stats.SampleValues.Contains(strVal))
+                    else if (!stats.DistinctValues.Contains(strVal))
+                        stats.Capped = true;
+                    if (stats.SampleValues.Count < maxSamples && stats.SampleSet.Add(strVal))
                         stats.SampleValues.Add(strVal);
 
                     if (BqlExpressionEvaluator.ToDoublePublic(kvp.Value) is { } numVal)
@@ -1143,7 +1235,7 @@ internal sealed class LegacyFieldSummaryOperator : BqlOperator
             row["count"] = kvp.Value.ValueCount;
             row["distinct_count"] = kvp.Value.DistinctValues.Count;
             row["type"] = kvp.Value.IsTime ? "time" : kvp.Value.ValueCount > 0 && kvp.Value.NumericCount == kvp.Value.ValueCount ? "numeric" : "string";
-            row["is_exact"] = kvp.Value.DistinctValues.Count <= 1000;
+            row["is_exact"] = !kvp.Value.Capped;
             row["numeric_count"] = kvp.Value.NumericCount;
             row["min"] = kvp.Value.NumericCount > 0 ? kvp.Value.Min : (object?)null;
             row["max"] = kvp.Value.NumericCount > 0 ? kvp.Value.Max : (object?)null;
@@ -1168,7 +1260,9 @@ internal sealed class LegacyFieldSummaryOperator : BqlOperator
         public double Min = double.MaxValue;
         public double Max = double.MinValue;
         public HashSet<string> DistinctValues = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> SampleSet = new(StringComparer.OrdinalIgnoreCase);
         public List<string> SampleValues = new();
+        public bool Capped;
     }
 }
 
@@ -1278,7 +1372,7 @@ internal sealed class LegacyInputLookupOperator : BqlOperator
 
     public override async Task<IEnumerable<dynamic>> ExecuteAsync(IEnumerable<dynamic> input, CancellationToken ct = default)
     {
-        var lookup = await _storage.GetLookupAsync(_lookupName, ct);
+        var lookup = await _storage.GetLookupAsync(_lookupName, Budget?.Caller ?? BqlCaller.Anyone, ct);
         if (lookup == null)
             throw new BqlExecutionException($"There's no lookup table named '{_lookupName}'");
 
@@ -1319,7 +1413,7 @@ internal sealed class LegacyLookupOperator : BqlOperator
 
     public override async Task<IEnumerable<dynamic>> ExecuteAsync(IEnumerable<dynamic> input, CancellationToken ct = default)
     {
-        var lookup = await _storage.GetLookupAsync(_lookupName, ct);
+        var lookup = await _storage.GetLookupAsync(_lookupName, Budget?.Caller ?? BqlCaller.Anyone, ct);
         if (lookup == null)
             throw new BqlExecutionException($"There's no lookup table named '{_lookupName}'");
 

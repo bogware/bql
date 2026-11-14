@@ -30,8 +30,12 @@ public sealed class BqlEngineOptions
     /// <summary>Rows a <c>join</c>, <c>append</c>, subsearch or multisearch leg may return. Default 50,000.</summary>
     public int SubsearchResultLimit { get; init; } = 50_000;
 
-    /// <summary>How deep macros may expand into other macros. Default 10.</summary>
-    public int MaxMacroDepth { get; init; } = 10;
+    /// <summary>
+    /// How deeply subsearches (<c>append</c>, <c>join</c>, <c>multisearch</c>, <c>subsearch</c>) and
+    /// macros may nest, counted together, so a macro that reaches itself through a subsearch stops
+    /// with an error instead of exhausting the stack. Default 10.
+    /// </summary>
+    public int MaxNestingDepth { get; init; } = 10;
 
     /// <summary>Longest a macro may expand to, in characters. Default 100,000.</summary>
     public int MaxMacroExpansionLength { get; init; } = 100_000;
@@ -39,7 +43,10 @@ public sealed class BqlEngineOptions
     /// <summary>Limits on what the parser accepts.</summary>
     public BqlParserLimits Parser { get; init; } = new();
 
-    /// <summary>Lookup tables and macros, or null when the host has none.</summary>
+    /// <summary>
+    /// Lookup tables and macros, or null when the host has none. Names come from query text and
+    /// are untrusted; see <see cref="IBqlKnowledgeProvider"/>.
+    /// </summary>
     public IBqlKnowledgeProvider? Knowledge { get; init; }
 
     /// <summary>Finds where IP addresses are, for <c>iplocation</c>, or null.</summary>
@@ -76,8 +83,14 @@ public sealed class BqlParserLimits
     /// </summary>
     public int MaxExpressionDepth { get; init; } = 1_000;
 
-    /// <summary>Deepest nesting of subsearches. Default 20.</summary>
+    /// <summary>Deepest nesting of subsearch brackets in the text. Default 20.</summary>
     public int MaxSubsearchDepth { get; init; } = 20;
+
+    /// <summary>Deepest nesting of parentheses in a search's words, such as <c>(a OR (b AND c))</c>. Default 100.</summary>
+    public int MaxSearchDepth { get; init; } = 100;
+
+    /// <summary>Largest <c>transaction maxevents=</c>. Default 100,000.</summary>
+    public int MaxTransactionEvents { get; init; } = 100_000;
 }
 
 /// <summary>Something the engine noticed that a host may want to log.</summary>
@@ -95,14 +108,21 @@ public enum BqlDiagnosticLevel
     Error,
 }
 
-/// <summary>Lookup tables and macros a host keeps for its users.</summary>
+/// <summary>
+/// Lookup tables and macros a host keeps for its users.
+/// <para>
+/// Names come straight from query text: treat them as untrusted input. Never use one as a file
+/// path or in a query of your own without checking it. The caller argument says who the query
+/// runs for, so a provider shared by several callers can return only what that caller may see.
+/// </para>
+/// </summary>
 public interface IBqlKnowledgeProvider
 {
-    /// <summary>A lookup table by name, or null.</summary>
-    Task<BqlLookupTable?> GetLookupAsync(string name, CancellationToken cancellationToken = default);
+    /// <summary>A lookup table by name, or null when there is none or the caller may not read it.</summary>
+    Task<BqlLookupTable?> GetLookupAsync(string name, BqlCaller caller, CancellationToken cancellationToken = default);
 
-    /// <summary>A macro by name, or null.</summary>
-    Task<BqlMacro?> GetMacroAsync(string name, CancellationToken cancellationToken = default);
+    /// <summary>A macro by name, or null when there is none or the caller may not use it.</summary>
+    Task<BqlMacro?> GetMacroAsync(string name, BqlCaller caller, CancellationToken cancellationToken = default);
 }
 
 /// <summary>A table of values, for <c>lookup</c> and <c>inputlookup</c>.</summary>

@@ -12,6 +12,9 @@ namespace Bogware.Bql.Natural;
 /// </summary>
 public sealed partial class NaturalReader
 {
+    /// <summary>How long one of the reader's own patterns may run on one word. They are simple; this only guards.</summary>
+    private static readonly TimeSpan PatternTimeout = TimeSpan.FromSeconds(1);
+
     private readonly BqlVocabulary _words;
 
     public NaturalReader(BqlVocabulary? words = null)
@@ -19,11 +22,27 @@ public sealed partial class NaturalReader
         _words = words ?? BqlVocabulary.Neutral;
     }
 
+    /// <summary>
+    /// Longest text read as a question. Questions are short; longer text is not read as words and
+    /// comes back with no structure, so a host searches it as typed. Default 2,000 characters.
+    /// </summary>
+    public int MaxInputLength { get; init; } = 2_000;
+
     /// <summary>Reads text with no pipes. <paramref name="now"/> anchors "since monday" and the like.</summary>
-    public NaturalReading Read(string text, FieldCatalog catalog, DateTime now) => new Pass(this, text, catalog, now, stagesOnly: false).Run();
+    public NaturalReading Read(string text, FieldCatalog catalog, DateTime now) =>
+        text.Length > MaxInputLength ? TooLong(text) : new Pass(this, text, catalog, now, stagesOnly: false).Run();
 
     /// <summary>Reads the text of one stage after a pipe, such as "count by host", into stages.</summary>
-    public NaturalReading ReadStages(string text, FieldCatalog catalog, DateTime now) => new Pass(this, text, catalog, now, stagesOnly: true).Run();
+    public NaturalReading ReadStages(string text, FieldCatalog catalog, DateTime now) =>
+        text.Length > MaxInputLength ? TooLong(text) : new Pass(this, text, catalog, now, stagesOnly: true).Run();
+
+    private static NaturalReading TooLong(string text) => new()
+    {
+        Input = text,
+        Query = "find *",
+        Explanation = "Too long to read as a question.",
+        Penalty = 1,
+    };
 
     internal enum Kind
     {
@@ -268,7 +287,7 @@ public sealed partial class NaturalReader
                 return (near, 1, false);
             }
 
-            if (loose && !_w.Filler.Contains(token.Lower) && !_w.Vocabulary.Contains(token.Lower) && Regex.IsMatch(token.Text, @"^[A-Za-z_][\w.]*$"))
+            if (loose && !_w.Filler.Contains(token.Lower) && !_w.Vocabulary.Contains(token.Lower) && Regex.IsMatch(token.Text, @"^[A-Za-z_][\w.]*$", RegexOptions.None, PatternTimeout))
             {
                 _pending[i] = (0.05, null);
                 return (token.Text, 1, false);
@@ -512,7 +531,7 @@ public sealed partial class NaturalReader
                 return (Iso(_now.Date.AddDays(-back)), 1);
             }
 
-            if (token.Kind is Kind.Word or Kind.Quoted && Regex.IsMatch(token.Text, @"^\d{4}-\d{2}-\d{2}") &&
+            if (token.Kind is Kind.Word or Kind.Quoted && Regex.IsMatch(token.Text, @"^\d{4}-\d{2}-\d{2}", RegexOptions.None, PatternTimeout) &&
                 DateTime.TryParse(token.Text, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var date))
             {
                 return (Iso(date), 1);
@@ -1361,7 +1380,7 @@ public sealed partial class NaturalReader
             }
 
             // A bare name after "on"/"from" that looks like a host
-            return Regex.IsMatch(token.Text, @"^[A-Za-z][\w-]*(\d|-)[\w.-]*$") && !_catalog.Values(hostField).Any()
+            return LooksLikeHostName(token.Text) && !_catalog.Values(hostField).Any()
                 ? (new ConditionRequest(hostField, "=", [token.Text]), 1)
                 : null;
         }
@@ -1475,7 +1494,62 @@ public sealed partial class NaturalReader
             return (new ConditionRequest(field, op, [value.ToString(CultureInfo.InvariantCulture)]), k - i + length);
         }
 
-        private static bool IsIp(string text) => Regex.IsMatch(text, @"^\d{1,3}(\.\d{1,3}){3}$|^[0-9a-f:]+:[0-9a-f:]*$", RegexOptions.IgnoreCase);
+        /// <summary>
+        /// An IPv4 address, or something made only of hex digits and colons with a colon in it
+        /// (IPv6). Checked by hand: the pattern this replaces backtracked on long words.
+        /// </summary>
+        private static bool IsIp(string text)
+        {
+            if (text.Length == 0)
+            {
+                return false;
+            }
+
+            var parts = text.Split('.');
+            if (parts.Length == 4 && parts.All(p => p.Length is >= 1 and <= 3 && p.All(char.IsAsciiDigit)))
+            {
+                return true;
+            }
+
+            return text.Contains(':') && text.All(c => c == ':' || char.IsAsciiHexDigit(c));
+        }
+
+        /// <summary>
+        /// A name like web-01 or db2.local: a letter first, then word characters, dots and dashes,
+        /// with a digit or dash somewhere after the first letter. Checked by hand, in one pass.
+        /// </summary>
+        private static bool LooksLikeHostName(string text)
+        {
+            if (text.Length == 0 || !char.IsAsciiLetter(text[0]))
+            {
+                return false;
+            }
+
+            var sawDigitOrDash = false;
+            var sawDot = false;
+            for (var i = 1; i < text.Length; i++)
+            {
+                var c = text[i];
+                if (c == '.')
+                {
+                    sawDot = true;
+                    continue;
+                }
+
+                if (!(char.IsLetterOrDigit(c) || c is '_' or '-'))
+                {
+                    return false;
+                }
+
+                // As before: the digit or dash comes before any dot
+                if (!sawDot && (char.IsDigit(c) || c == '-'))
+                {
+                    sawDigitOrDash = true;
+                }
+            }
+
+            return sawDigitOrDash;
+        }
 
         // ─── Severity ────────────────────────────────────────────
 
@@ -1840,7 +1914,7 @@ public sealed partial class NaturalReader
 
             _r.Stages = stages;
             var search = new StringBuilder(_r.Terms.Count > 0 ? string.Join(" ", _r.Terms) : "*");
-            if (_r.Earliest is { } earliest && _r.Latest == null && Regex.IsMatch(earliest, @"^-\d+[smhdw]$"))
+            if (_r.Earliest is { } earliest && _r.Latest == null && Regex.IsMatch(earliest, @"^-\d+[smhdw]$", RegexOptions.None, PatternTimeout))
             {
                 search.Append(" from last ").Append(earliest[1..]);
             }
@@ -1993,7 +2067,7 @@ public sealed partial class NaturalReader
 
         private static string DescribeSpan(string span)
         {
-            var match = Regex.Match(span, @"^(?<n>\d+)(?<u>[smhdwMy])$");
+            var match = Regex.Match(span, @"^(?<n>\d+)(?<u>[smhdwMy])$", RegexOptions.None, PatternTimeout);
             if (!match.Success)
             {
                 return span;

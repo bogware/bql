@@ -91,6 +91,12 @@ public class BqlParseException : Exception
     {
         Position = position;
     }
+
+    /// <summary>A failure with the error behind it, for the host to log. The message stays generic.</summary>
+    public BqlParseException(string message, Exception inner)
+        : base(message, inner)
+    {
+    }
 }
 
 /// <summary>
@@ -104,6 +110,12 @@ public abstract class BqlOperator
 
     /// <summary>Runs the stage over its input.</summary>
     public abstract Task<IEnumerable<dynamic>> ExecuteAsync(IEnumerable<dynamic> input, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Stages that work through all their rows at once check for cancellation this often, so a
+    /// query's time limit stops them too.
+    /// </summary>
+    internal const int CancellationCheckInterval = 1024;
 
     /// <summary>The query's limits and schema, so a stage keeps to them.</summary>
     internal BqlBudget? Budget { get; set; }

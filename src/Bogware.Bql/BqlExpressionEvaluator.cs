@@ -22,9 +22,12 @@ public static class BqlExpressionEvaluator
 
     /// <summary>
     /// How long a pattern someone wrote may spend on one value: a detection rule's time while one
-    /// is being checked, otherwise a search's (<c>Limits:QueryRegexTimeoutMs</c>).
+    /// is being checked, otherwise the running query's <see cref="BqlLimits.RegexTimeoutPerRow"/>.
     /// </summary>
-    private static TimeSpan RegexTimeout => t_detectionRegexTimeout ?? BqlRegex.PerEventTimeout;
+    private static TimeSpan RegexTimeout => t_detectionRegexTimeout ?? Limits.RegexTimeoutPerRow;
+
+    /// <summary>The limits of the query being evaluated, or the defaults outside one.</summary>
+    private static BqlLimits Limits => BqlScope.Limits;
 
     /// <summary>
     /// Evaluates a detection rule's condition. A pattern in it that runs out of time throws
@@ -71,15 +74,55 @@ public static class BqlExpressionEvaluator
     {
         LiteralExpression lit => lit.Value,
         FieldExpression field => GetFieldValue(context, field.Name),
-        ArithmeticExpression arith => Finite(EvaluateArithmetic(arith, context)),
+        ArithmeticExpression arith => Bounded(Finite(EvaluateArithmetic(arith, context))),
         ComparisonExpression comp => EvaluateComparison(comp, context),
         LogicalExpression logical => EvaluateLogical(logical, context),
         NotExpression not => !EvaluateBool(not.Operand, context),
         InExpression inExpr => EvaluateIn(inExpr, context),
         LikeExpression like => EvaluateLike(like, context),
-        FunctionExpression func => Finite(EvaluateFunction(func, context)),
+        FunctionExpression func => Bounded(Finite(EvaluateFunction(func, context))),
         _ => null
     };
+
+    /// <summary>
+    /// Stops a value that has grown past the query's limits: text longer than
+    /// <see cref="BqlLimits.MaxValueLength"/>, or a multi-value with more than
+    /// <see cref="BqlLimits.MaxMultiValueCount"/> values or more text in total. Each step can at
+    /// most double what it was given, so checking every result keeps growth bounded.
+    /// </summary>
+    private static object? Bounded(object? value)
+    {
+        var limits = Limits;
+        switch (value)
+        {
+            case string text when text.Length > limits.MaxValueLength:
+                throw TooBig($"a value of {text.Length:N0} characters");
+            // Multi-values come as lists, or as arrays from split and the like
+            case System.Collections.ICollection list:
+                if (list.Count > limits.MaxMultiValueCount)
+                {
+                    throw TooBig($"{list.Count:N0} values in one field");
+                }
+
+                long total = 0;
+                foreach (var item in list)
+                {
+                    total += item is string s ? s.Length : 0;
+                }
+
+                if (total > limits.MaxValueLength)
+                {
+                    throw TooBig($"{total:N0} characters in one field");
+                }
+
+                break;
+        }
+
+        return value;
+    }
+
+    private static BqlLimitExceededException TooBig(string what) =>
+        new($"The query built {what}, more than it may hold. Look for a value that grows in a loop, such as x = x + x.");
 
     private static object? Finite(object? value) =>
         value is double number && !double.IsFinite(number) ? null : value;
@@ -224,7 +267,7 @@ public static class BqlExpressionEvaluator
         if (rawValue == null) return false;
         var value = rawValue.ToString() ?? "";
         // Guard against excessively long LIKE patterns
-        if (expr.Pattern.Length > 10_000) return false;
+        if (expr.Pattern.Length > Limits.MaxPatternLength) return false;
         var regex = LikePatterns.GetOrAdd(expr.Pattern, static like =>
         {
             // Convert SQL LIKE pattern to regex: first replace wildcards, then escape the rest.
@@ -387,17 +430,17 @@ public static class BqlExpressionEvaluator
     private static object? EvalLpad(List<object?> args)
     {
         var str = args.ElementAtOrDefault(0)?.ToString() ?? "";
-        var width = (int)(ToDouble(args.ElementAtOrDefault(1)) ?? 0);
+        var width = (int)Math.Clamp(ToDouble(args.ElementAtOrDefault(1)) ?? 0, 0, int.MaxValue);
         var padChar = args.ElementAtOrDefault(2)?.ToString()?.FirstOrDefault() ?? ' ';
-        return str.PadLeft(Math.Min(width, 1000), padChar);
+        return str.PadLeft(Math.Min(width, Limits.MaxPadWidth), padChar);
     }
 
     private static object? EvalRpad(List<object?> args)
     {
         var str = args.ElementAtOrDefault(0)?.ToString() ?? "";
-        var width = (int)(ToDouble(args.ElementAtOrDefault(1)) ?? 0);
+        var width = (int)Math.Clamp(ToDouble(args.ElementAtOrDefault(1)) ?? 0, 0, int.MaxValue);
         var padChar = args.ElementAtOrDefault(2)?.ToString()?.FirstOrDefault() ?? ' ';
-        return str.PadRight(Math.Min(width, 1000), padChar);
+        return str.PadRight(Math.Min(width, Limits.MaxPadWidth), padChar);
     }
 
     private static object? EvalLike(List<object?> args)
@@ -406,7 +449,7 @@ public static class BqlExpressionEvaluator
         if (args.ElementAtOrDefault(0) == null) return false;
         var str = args[0]!.ToString() ?? "";
         var pattern = args.ElementAtOrDefault(1)?.ToString() ?? "";
-        if (pattern.Length > 10_000) return false; // Guard against excessively long patterns
+        if (pattern.Length > Limits.MaxPatternLength) return false; // Guard against excessively long patterns
         // SQL-like LIKE: % = any chars, _ = single char
         return EvaluateLike(new LikeExpression(new LiteralExpression(str), pattern), EmptyContext) is true;
     }
@@ -529,10 +572,28 @@ public static class BqlExpressionEvaluator
         var start = ToDouble(args.ElementAtOrDefault(0));
         var end = ToDouble(args.ElementAtOrDefault(1));
         var step = ToDouble(args.ElementAtOrDefault(2)) ?? 1;
-        if (start == null || end == null || step == 0 || (end - start) / step > 10_000) return null;
-        var values = new List<object?>();
-        for (var value = start.Value; step > 0 ? value < end : value > end; value += step)
+        if (start == null || end == null || step == 0 || !double.IsFinite(step))
         {
+            return null;
+        }
+
+        // Count first, then step by index: adding a small step to a huge number can leave it
+        // unchanged, which would loop forever.
+        var count = Math.Ceiling((end.Value - start.Value) / step);
+        if (!(count > 0))
+        {
+            return new List<object?>();
+        }
+
+        if (count > Limits.MaxMultiValueCount)
+        {
+            throw TooBig($"mvrange of {count:N0} values");
+        }
+
+        var values = new List<object?>((int)count);
+        for (var i = 0; i < (int)count; i++)
+        {
+            var value = start.Value + i * step;
             values.Add(value % 1 == 0 && Math.Abs(value) < long.MaxValue ? (long)value : value);
         }
 
@@ -582,7 +643,7 @@ public static class BqlExpressionEvaluator
         var str = args.ElementAtOrDefault(0)?.ToString();
         var pattern = args.ElementAtOrDefault(1)?.ToString();
         if (str == null || pattern == null) return false;
-        if (pattern.Length > 10_000) return false; // Guard against excessively long patterns
+        if (pattern.Length > Limits.MaxPatternLength) return false; // Guard against excessively long patterns
 
         try
         {
@@ -688,7 +749,7 @@ public static class BqlExpressionEvaluator
             }
             return ExtractJsonElement(current);
         }
-        catch { return null; }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or ArgumentException or FormatException) { return null; }
     }
 
     private static object? EvalJsonExtract(List<object?> args) => EvalFromJson(args);
@@ -773,7 +834,7 @@ public static class BqlExpressionEvaluator
         var str = args.FirstOrDefault()?.ToString();
         if (str == null) return null;
         try { return Encoding.UTF8.GetString(Convert.FromBase64String(str)); }
-        catch { return null; }
+        catch (FormatException) { return null; }
     }
 
     private static object? EvalTypeOf(List<object?> args)
@@ -955,7 +1016,11 @@ public static class BqlExpressionEvaluator
         if (str == null) return null;
         var match = Regex.Match(str, @"^([\d.]+)\s*(B|K|KB|M|MB|G|GB|T|TB)?$", RegexOptions.IgnoreCase, RegexTimeout);
         if (!match.Success) return ToDouble(str);
-        var value = double.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+        if (!double.TryParse(match.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+        {
+            return null;
+        }
+
         var unit = match.Groups[2].Value.ToUpperInvariant();
         return unit switch
         {
@@ -983,8 +1048,13 @@ public static class BqlExpressionEvaluator
         var str = args.ElementAtOrDefault(0)?.ToString();
         var numBase = (int)(ToDouble(args.ElementAtOrDefault(1)) ?? 10);
         if (str == null) return null;
+        if (numBase is not (2 or 8 or 10 or 16))
+        {
+            return null;
+        }
+
         try { return (double)System.Convert.ToInt64(str, numBase); }
-        catch { return null; }
+        catch (Exception ex) when (ex is FormatException or OverflowException or ArgumentException) { return null; }
     }
 
     private static object? EvalPrintf(List<object?> args)
@@ -1001,10 +1071,10 @@ public static class BqlExpressionEvaluator
             if (type == '%') return "%";
 
             var arg = args.ElementAtOrDefault(next++);
-            var precision = match.Groups["precision"].Success ? int.Parse(match.Groups["precision"].Value, CultureInfo.InvariantCulture) : (int?)null;
-
-            // .NET allows hundreds of millions of digits, so one query could allocate gigabytes
-            if (precision > 100) precision = 100;
+            var limits = Limits;
+            int? precision = match.Groups["precision"].Success
+                ? (int.TryParse(match.Groups["precision"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var p) ? Math.Min(p, limits.MaxFormatPrecision) : limits.MaxFormatPrecision)
+                : null;
             var number = ToDouble(arg);
             var text = type switch
             {
@@ -1017,8 +1087,9 @@ public static class BqlExpressionEvaluator
             };
 
             var flags = match.Groups["flags"].Value;
-            var width = match.Groups["width"].Length > 0 ? int.Parse(match.Groups["width"].Value, CultureInfo.InvariantCulture) : 0;
-            width = Math.Min(width, 1000);
+            var width = match.Groups["width"].Length == 0 ? 0
+                : int.TryParse(match.Groups["width"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var w) ? Math.Min(w, limits.MaxPadWidth)
+                : limits.MaxPadWidth;
             if (flags.Contains('-')) return text.PadRight(width);
             return flags.Contains('0') && type != 's' ? text.PadLeft(width, '0') : text.PadLeft(width);
         }, RegexOptions.None, RegexTimeout);
@@ -1066,6 +1137,19 @@ public static class BqlExpressionEvaluator
         {
             context.TryGetValue(actualKey, out val);
             return val;
+        }
+
+        // The row may have gained fields since the map was built; look again before saying no.
+        if (_ciKeyMap != null && _ciKeyMap.Count != context.Count)
+        {
+            foreach (var (key, value) in context)
+            {
+                if (key.Equals(name, StringComparison.OrdinalIgnoreCase))
+                {
+                    _lastContext = null;
+                    return value;
+                }
+            }
         }
 
         return null;

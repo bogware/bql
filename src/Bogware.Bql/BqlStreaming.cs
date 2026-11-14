@@ -10,36 +10,89 @@ public sealed class BqlLimits
 {
     /// <summary>
     /// Rows kept for stages that need all their input at once, such as <c>sort</c> without
-    /// <c>head</c>, <c>eventstats</c> and <c>transaction</c>. Beyond this the input is cut off and
-    /// the result marked truncated. Filters and aggregates don't keep rows, so this doesn't limit them.
+    /// <c>head</c>, <c>eventstats</c> and <c>transaction</c>, and rows a <c>join</c> or
+    /// <c>mvexpand</c> may produce. Beyond this the rows are cut off and the result marked truncated.
+    /// Filters and aggregates don't keep rows, so this doesn't limit them. Default 100,000.
     /// </summary>
-    public int MaxRowsInMemory { get; set; } = 100_000;
+    public int MaxRowsInMemory { get; init; } = 100_000;
 
-    /// <summary>Groups an aggregate can produce before the query fails.</summary>
-    public int MaxGroups { get; set; } = 100_000;
+    /// <summary>Groups an aggregate can produce before the query fails. Default 100,000.</summary>
+    public int MaxGroups { get; init; } = 100_000;
 
     /// <summary>
     /// Values kept across <c>dc</c>, <c>median</c> and percentile aggregates before the query fails.
+    /// Default 20,000,000.
     /// </summary>
-    public long MaxRetainedValues { get; set; } = 20_000_000;
+    public long MaxRetainedValues { get; init; } = 20_000_000;
 
     /// <summary>
     /// Values kept for one <c>median</c> or percentile. Beyond this it samples, and the result is
-    /// marked approximate.
+    /// marked approximate. Default 100,000.
     /// </summary>
-    public int MaxExactPercentileValues { get; set; } = 100_000;
+    public int MaxExactPercentileValues { get; init; } = 100_000;
 
     /// <summary>
     /// Events read by one query before it stops and is marked truncated. 0 means no limit, leaving
     /// the query's timeout to stop it.
     /// </summary>
-    public long MaxEventsScanned { get; set; }
+    public long MaxEventsScanned { get; init; }
 
     /// <summary>
     /// Times a query's regular expression may run out of time on a row before the query fails,
     /// rather than spend its whole time limit on one slow pattern. Default 8.
     /// </summary>
-    public int MaxRegexTimeouts { get; set; } = 8;
+    public int MaxRegexTimeouts { get; init; } = 8;
+
+    /// <summary>
+    /// How long a pattern from the query (<c>rex</c>, <c>regex</c>, <c>match()</c>, <c>replace()</c>)
+    /// may spend on one value. Default 250 ms.
+    /// </summary>
+    public TimeSpan RegexTimeoutPerRow { get; init; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// Longest text a query may build in one value, and the most text across the values of one
+    /// multi-value field. A value that grows past it fails the query. Default 1,000,000 characters.
+    /// </summary>
+    public int MaxValueLength { get; init; } = 1_000_000;
+
+    /// <summary>Most values one multi-value field may hold when a query builds it. Default 10,000.</summary>
+    public int MaxMultiValueCount { get; init; } = 10_000;
+
+    /// <summary>
+    /// Widest <c>streamstats window=</c>. Each row looks back over the window, so time grows with
+    /// rows times window. Default 10,000.
+    /// </summary>
+    public int MaxStreamStatsWindow { get; init; } = 10_000;
+
+    /// <summary>Most rows <c>makeresults</c> makes; more are cut off and the result marked truncated. Default 50,000.</summary>
+    public int MaxMakeResults { get; init; } = 50_000;
+
+    /// <summary>Longest pattern <c>like</c>, <c>match()</c> and <c>replace()</c> accept. Default 10,000 characters.</summary>
+    public int MaxPatternLength { get; init; } = 10_000;
+
+    /// <summary>Widest padding <c>lpad()</c>, <c>rpad()</c> and <c>printf()</c> add. Default 1,000 characters.</summary>
+    public int MaxPadWidth { get; init; } = 1_000;
+
+    /// <summary>
+    /// Most digits <c>printf()</c> writes after the point. .NET allows hundreds of millions, so
+    /// this keeps one call from allocating gigabytes. Default 100.
+    /// </summary>
+    public int MaxFormatPrecision { get; init; } = 100;
+
+    /// <summary>
+    /// Distinct values <c>fieldsummary</c> counts per field; past it new values aren't counted and
+    /// the field's counts are marked inexact. Default 100,000.
+    /// </summary>
+    public int MaxFieldSummaryValues { get; init; } = 100_000;
+}
+
+/// <summary>Who a query runs for: what its caller may read. Passed to subsearches and to the host's providers.</summary>
+/// <param name="AllowedDatasets">Datasets the caller may read, as in <see cref="BqlExecutionContext.AllowedDatasets"/>. Null means all.</param>
+/// <param name="Dataset">The dataset the query is scoped to, or null.</param>
+public sealed record BqlCaller(IReadOnlyList<string>? AllowedDatasets, string? Dataset)
+{
+    /// <summary>A caller with no restrictions.</summary>
+    public static BqlCaller Anyone { get; } = new(null, null);
 }
 
 /// <summary>A query went over a limit, in a way that would make its answer wrong if it continued.</summary>
@@ -61,17 +114,45 @@ public sealed class BqlExecutionException : BqlParseException
         : base(message)
     {
     }
+
+    /// <summary>A failure with the error that caused it, for the host to log. The message stays generic.</summary>
+    public BqlExecutionException(string message, Exception inner)
+        : base(message, inner)
+    {
+    }
 }
 
-/// <summary>What one query has used so far.</summary>
+/// <summary>Sorts exceptions into those a query may handle and those it must never swallow.</summary>
+internal static class BqlFailures
+{
+    /// <summary>The process is in trouble; nothing may catch and carry on.</summary>
+    public static bool IsFatal(Exception ex) =>
+        ex is OutOfMemoryException or InsufficientExecutionStackException or StackOverflowException or AccessViolationException;
+
+    /// <summary>Failures a stage passes on unchanged: cancellation, limits, and fatal errors.</summary>
+    public static bool PassesThrough(Exception ex) =>
+        ex is OperationCanceledException or BqlLimitExceededException || IsFatal(ex);
+}
+
+/// <summary>
+/// What one query has used so far, and the scope it runs in: who it runs for, its time bounds, its
+/// deadline and how deeply it is nested in other queries. Subsearches and macros get a nested
+/// budget that shares the counters.
+/// </summary>
 internal sealed class BqlBudget
 {
-    private long _retainedValues;
+    private readonly Usage _usage;
 
     public BqlBudget(BqlLimits limits, BqlSchema? schema = null)
+        : this(limits, schema ?? BqlSchema.Default, new Usage())
+    {
+    }
+
+    private BqlBudget(BqlLimits limits, BqlSchema schema, Usage usage)
     {
         Limits = limits;
-        Schema = schema ?? BqlSchema.Default;
+        Schema = schema;
+        _usage = usage;
     }
 
     /// <summary>A budget with default limits, for stages run outside an engine.</summary>
@@ -82,13 +163,46 @@ internal sealed class BqlBudget
     /// <summary>The schema of the rows the query reads.</summary>
     public BqlSchema Schema { get; }
 
-    public bool Truncated { get; set; }
+    /// <summary>Who the query runs for. Subsearches run for the same caller.</summary>
+    public BqlCaller Caller { get; init; } = BqlCaller.Anyone;
 
-    public bool Approximate { get; set; }
+    /// <summary>The caller's time bounds, which subsearches keep.</summary>
+    public DateTime? StartTime { get; init; }
+
+    /// <summary>The caller's time bounds, which subsearches keep.</summary>
+    public DateTime? EndTime { get; init; }
+
+    /// <summary>When the outermost query's time runs out. Subsearches get what is left.</summary>
+    public DateTime Deadline { get; init; } = DateTime.MaxValue;
+
+    /// <summary>How deeply this query sits inside subsearches and macros. The outermost is 0.</summary>
+    public int Depth { get; init; }
+
+    public bool Truncated
+    {
+        get => _usage.Truncated;
+        set => _usage.Truncated = value;
+    }
+
+    public bool Approximate
+    {
+        get => _usage.Approximate;
+        set => _usage.Approximate = value;
+    }
+
+    /// <summary>The same budget, <paramref name="levels"/> deeper, as stages inside a macro see it.</summary>
+    public BqlBudget Deeper(int levels) => new(Limits, Schema, _usage)
+    {
+        Caller = Caller,
+        StartTime = StartTime,
+        EndTime = EndTime,
+        Deadline = Deadline,
+        Depth = Depth + levels,
+    };
 
     public void RetainValue()
     {
-        if (++_retainedValues > Limits.MaxRetainedValues)
+        if (Interlocked.Increment(ref _usage.RetainedValues) > Limits.MaxRetainedValues)
         {
             throw new BqlLimitExceededException(
                 $"The query keeps more than {Limits.MaxRetainedValues:N0} distinct or percentile values. Narrow the time range or group by fewer fields.");
@@ -102,6 +216,39 @@ internal sealed class BqlBudget
             throw new BqlLimitExceededException(
                 $"The query produces more than {Limits.MaxGroups:N0} groups. Narrow the time range or group by fewer fields.");
         }
+    }
+
+    /// <summary>Counters shared by a query and the subsearches and macros inside it.</summary>
+    private sealed class Usage
+    {
+        public long RetainedValues;
+        public bool Truncated;
+        public bool Approximate;
+    }
+}
+
+/// <summary>
+/// The limits of the query running on this logical thread, for code that has no budget to hand,
+/// such as expression functions. The engine enters a scope for each query; outside one, the
+/// defaults apply.
+/// </summary>
+internal static class BqlScope
+{
+    private static readonly AsyncLocal<BqlLimits?> Current = new();
+    private static readonly BqlLimits Defaults = new();
+
+    public static BqlLimits Limits => Current.Value ?? Defaults;
+
+    public static IDisposable Enter(BqlLimits limits)
+    {
+        var previous = Current.Value;
+        Current.Value = limits;
+        return new Restore(previous);
+    }
+
+    private sealed class Restore(BqlLimits? previous) : IDisposable
+    {
+        public void Dispose() => Current.Value = previous;
     }
 }
 
@@ -356,7 +503,8 @@ internal sealed class TimechartSink : IRowSink
 
     public TimechartSink(TimeSpan span, AggregateFunction function, string? byField, BqlBudget budget)
     {
-        _span = span;
+        // A query built by a dialect skips the parser's check, so check again here
+        _span = span > TimeSpan.Zero ? span : throw new BqlExecutionException("timechart needs a span above zero");
         _function = function;
         _byField = byField;
         _budget = budget;
@@ -1045,25 +1193,12 @@ internal sealed class BqlValueComparer : IComparer<object?>
     };
 }
 
-/// <summary>Settings for regular expressions in searches.</summary>
-public static class BqlRegex
-{
-    /// <summary>
-    /// How long a query's pattern (<c>rex</c>, <c>regex</c>, <c>match()</c>) can spend on one row.
-    /// Process-wide; set once at startup. Default 250 ms.
-    /// </summary>
-    public static TimeSpan PerEventTimeout { get; set; } = TimeSpan.FromMilliseconds(250);
-}
-
 /// <summary>
 /// Stops a slow regular expression from using a query's whole time limit: each event gets a short
 /// allowance, and a pattern that keeps running out fails the query.
 /// </summary>
 internal sealed class RegexTimeoutTracker
 {
-    /// <summary>How long a pattern can spend on one event.</summary>
-    public static TimeSpan PerEvent => BqlRegex.PerEventTimeout;
-
     private readonly string _pattern;
     private readonly int _maxTimeouts;
     private int _timeouts;

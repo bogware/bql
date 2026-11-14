@@ -193,7 +193,7 @@ public sealed class BqlOptimizer
         // Words would read as field names in a where; the search evaluates them itself
         try
         {
-            if (BqlTextSearch.Parse(search.SearchText).HasText)
+            if (BqlTextSearch.Parse(search.SearchText, _parser.Limits.MaxSearchDepth).HasText)
                 return stage;
         }
         catch (BqlParseException)
@@ -249,7 +249,7 @@ public sealed class BqlOptimizer
     {
         // A source that searches text finds rows with all of some words. That narrows any search
         // whose words are all required; the pipeline checks the rest (OR, NOT, phrases, wildcards).
-        var parsed = BqlTextSearch.Parse(search.SearchText);
+        var parsed = BqlTextSearch.Parse(search.SearchText, _parser.Limits.MaxSearchDepth);
         if (parsed.RequiredWords != null)
         {
             var terms = SearchTerms.Parse(parsed.RequiredWords);

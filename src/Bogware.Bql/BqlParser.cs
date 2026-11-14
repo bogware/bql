@@ -40,7 +40,18 @@ public sealed class BqlParser
     /// <summary>
     /// Parse a BQL or SPL query string into a BQL AST. Safe to call from many threads at once.
     /// </summary>
-    public BqlQuery ParseBql(string query) => new BqlParser(_schema, _limits).ParseBqlCore(query);
+    public BqlQuery ParseBql(string query)
+    {
+        try
+        {
+            return new BqlParser(_schema, _limits).ParseBqlCore(query);
+        }
+        catch (Exception ex) when (ex is not BqlParseException && !BqlFailures.PassesThrough(ex))
+        {
+            // Whatever the text, a caller gets a parse error, never a raw .NET exception.
+            throw new BqlParseException("The query could not be read.", ex);
+        }
+    }
 
     private BqlQuery ParseBqlCore(string query)
     {
@@ -460,10 +471,18 @@ public sealed class BqlParser
         if (Current.Kind == BqlTokenKind.NumberLiteral)
         {
             var val = Current.Value;
+            var at = Current.Position;
             Advance();
             if (val.Contains('.'))
-                return new LiteralExpression(double.Parse(val, CultureInfo.InvariantCulture));
-            return new LiteralExpression(long.Parse(val, CultureInfo.InvariantCulture));
+            {
+                return double.TryParse(val, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var real) && double.IsFinite(real)
+                    ? new LiteralExpression(real)
+                    : throw new BqlParseException($"'{val}' isn't a number BQL can hold", $"position {at}");
+            }
+
+            return long.TryParse(val, NumberStyles.None, CultureInfo.InvariantCulture, out var whole)
+                ? new LiteralExpression(whole)
+                : throw new BqlParseException($"'{val}' is too large; whole numbers go up to {long.MaxValue}", $"position {at}");
         }
 
         // Star (wildcard)
@@ -754,6 +773,7 @@ public sealed class BqlParser
             throw new BqlParseException("Expected regex pattern string", $"position {Current.Position}");
 
         var pattern = Current.Value;
+        ValidatePattern(pattern, "rex");
         Advance();
 
         // BQL: "from" source
@@ -853,7 +873,8 @@ public sealed class BqlParser
                 Advance(); Advance(); // skip "span" "="
                 if (Current.Kind == BqlTokenKind.TimeSpanLiteral)
                 {
-                    span = ParseTimeSpanValue(Current.Value) ?? span;
+                    span = ParseTimeSpanValue(Current.Value)
+                        ?? throw new BqlParseException($"span={Current.Value} isn't a span timechart can use: it must be above zero and at most ten years", $"position {Current.Position}");
                     Advance();
                 }
             }
@@ -1157,10 +1178,12 @@ public sealed class BqlParser
                 Advance(); Advance(); // skip "span" and "="
                 var spanStr = Current.Value;
                 Advance();
-                // Try time span (1h, 30m, 1d, etc.)
+                // Try time span (1h, 30m, 1d, etc.), then a number
                 stage.Span = ParseTimeSpanValue(spanStr);
-                if (!stage.Span.HasValue && double.TryParse(spanStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var numSpan))
+                if (!stage.Span.HasValue && double.TryParse(spanStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var numSpan) && double.IsFinite(numSpan) && numSpan > 0)
                     stage.NumericSpan = numSpan;
+                if (!stage.Span.HasValue && !stage.NumericSpan.HasValue)
+                    throw new BqlParseException($"span={spanStr} isn't a span bin can use: give a time like 1h or a number above zero", $"position {Current.Position}");
             }
             else if (Current.IsKeyword("as"))
             {
@@ -1182,15 +1205,15 @@ public sealed class BqlParser
             Peek(1).Kind == BqlTokenKind.Equals)
         {
             Advance(); Advance(); // skip "count" and "="
-            if (int.TryParse(Current.Value, out var count))
+            if (int.TryParse(Current.Value, NumberStyles.None, CultureInfo.InvariantCulture, out var count))
             {
-                stage.Count = Math.Min(count, 50000); // cap at 50K
+                stage.Count = count; // BqlLimits.MaxMakeResults caps it when it runs
                 Advance();
             }
         }
-        else if (Current.Kind == BqlTokenKind.NumberLiteral && int.TryParse(Current.Value, out var directCount))
+        else if (Current.Kind == BqlTokenKind.NumberLiteral && int.TryParse(Current.Value, NumberStyles.None, CultureInfo.InvariantCulture, out var directCount))
         {
-            stage.Count = Math.Min(directCount, 50000);
+            stage.Count = directCount;
             Advance();
         }
         return stage;
@@ -1321,9 +1344,26 @@ public sealed class BqlParser
             throw new BqlParseException("Expected a pattern after regex", $"position {Current.Position}");
 
         stage.Pattern = Current.Value;
+        ValidatePattern(stage.Pattern, "regex");
         Advance();
         return stage;
     }
+
+    /// <summary>A pattern that doesn't compile is a mistake in the query, reported where it is.</summary>
+    private void ValidatePattern(string pattern, string stage)
+    {
+        try
+        {
+            _ = new Regex(pattern, RegexOptions.None, PatternCheckTimeout);
+        }
+        catch (ArgumentException ex)
+        {
+            throw new BqlParseException($"The {stage} pattern isn't a valid regular expression: {ex.Message}", $"position {Current.Position}");
+        }
+    }
+
+    /// <summary>Compiling a pattern to check it never matches anything, so any short limit will do.</summary>
+    private static readonly TimeSpan PatternCheckTimeout = TimeSpan.FromSeconds(1);
 
     private FieldSummaryStage ParseFieldSummaryStage()
     {
@@ -1390,7 +1430,8 @@ public sealed class BqlParser
         var match = Regex.Match(value, @"^(\d+)(s|m|h|d|w)$", RegexOptions.IgnoreCase, TimeSpan.FromSeconds(1));
         if (!match.Success) return null;
         // Use long.TryParse to prevent overflow on very large values, clamp to reasonable max (10 years)
-        if (!long.TryParse(match.Groups[1].Value, CultureInfo.InvariantCulture, out var amount) || amount < 0)
+        // A span of zero would divide by zero wherever it is used
+        if (!long.TryParse(match.Groups[1].Value, CultureInfo.InvariantCulture, out var amount) || amount <= 0)
             return null;
         const long maxDays = 3650; // ~10 years
         return match.Groups[2].Value.ToLowerInvariant() switch
@@ -1476,7 +1517,7 @@ public sealed class BqlParser
                 if (Current.Kind == BqlTokenKind.Equals) Advance();
                 if (Current.Kind == BqlTokenKind.NumberLiteral)
                 {
-                    maxEvents = Math.Clamp(ExpectNumber(), 1, 100_000);
+                    maxEvents = Math.Clamp(ExpectNumber(), 1, _limits.MaxTransactionEvents);
                 }
                 continue;
             }

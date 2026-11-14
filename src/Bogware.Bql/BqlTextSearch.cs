@@ -40,12 +40,17 @@ public sealed class BqlTextSearch
     /// <summary>Whether it has any word or phrase, as opposed to only field terms.</summary>
     public bool HasText { get; private init; }
 
+    private static readonly int DefaultMaxDepth = new BqlParserLimits().MaxSearchDepth;
+
     /// <summary>Parses search text. Text with nothing to match, like <c>*</c>, matches everything.</summary>
-    public static BqlTextSearch Parse(string? text)
+    public static BqlTextSearch Parse(string? text) => Parse(text, DefaultMaxDepth);
+
+    /// <summary>Parses search text, allowing parentheses to nest <paramref name="maxDepth"/> deep.</summary>
+    public static BqlTextSearch Parse(string? text, int maxDepth)
     {
         var tokens = Tokenize(text ?? string.Empty);
         var position = 0;
-        var root = tokens.Count == 0 ? new All() : ParseOr(tokens, ref position, depth: 0);
+        var root = tokens.Count == 0 ? new All() : ParseOr(tokens, ref position, depth: 0, maxDepth);
         if (position < tokens.Count)
         {
             throw new BqlParseException($"Unexpected '{tokens[position].Text}' in the search");
@@ -151,23 +156,22 @@ public sealed class BqlTextSearch
     /// How deep parentheses can nest. Parsing and matching recurse once per level, so without a
     /// limit enough of them would overflow the stack and end the process.
     /// </summary>
-    internal const int MaxDepth = 100;
 
-    private static Node ParseOr(List<Token> tokens, ref int position, int depth)
+    private static Node ParseOr(List<Token> tokens, ref int position, int depth, int maxDepth)
     {
-        var parts = new List<Node> { ParseAnd(tokens, ref position, depth) };
+        var parts = new List<Node> { ParseAnd(tokens, ref position, depth, maxDepth) };
         while (position < tokens.Count && tokens[position].Kind == Kind.Or)
         {
             position++;
-            parts.Add(ParseAnd(tokens, ref position, depth));
+            parts.Add(ParseAnd(tokens, ref position, depth, maxDepth));
         }
 
         return parts.Count == 1 ? parts[0] : new Or(parts);
     }
 
-    private static Node ParseAnd(List<Token> tokens, ref int position, int depth)
+    private static Node ParseAnd(List<Token> tokens, ref int position, int depth, int maxDepth)
     {
-        var parts = new List<Node> { ParseUnary(tokens, ref position, depth) };
+        var parts = new List<Node> { ParseUnary(tokens, ref position, depth, maxDepth) };
         while (position < tokens.Count && tokens[position].Kind is not (Kind.Or or Kind.Close))
         {
             if (tokens[position].Kind == Kind.And)
@@ -175,13 +179,13 @@ public sealed class BqlTextSearch
                 position++;
             }
 
-            parts.Add(ParseUnary(tokens, ref position, depth));
+            parts.Add(ParseUnary(tokens, ref position, depth, maxDepth));
         }
 
         return parts.Count == 1 ? parts[0] : new And(parts);
     }
 
-    private static Node ParseUnary(List<Token> tokens, ref int position, int depth)
+    private static Node ParseUnary(List<Token> tokens, ref int position, int depth, int maxDepth)
     {
         // In a loop: recursing here would let a long chain of NOT overflow the stack
         var negations = 0;
@@ -191,11 +195,11 @@ public sealed class BqlTextSearch
             negations++;
         }
 
-        var operand = ParseOperand(tokens, ref position, depth);
+        var operand = ParseOperand(tokens, ref position, depth, maxDepth);
         return negations % 2 == 0 ? operand : new Not(operand);
     }
 
-    private static Node ParseOperand(List<Token> tokens, ref int position, int depth)
+    private static Node ParseOperand(List<Token> tokens, ref int position, int depth, int maxDepth)
     {
         if (position >= tokens.Count)
         {
@@ -212,13 +216,13 @@ public sealed class BqlTextSearch
 
         if (token.Kind == Kind.Open)
         {
-            if (depth >= MaxDepth)
+            if (depth >= maxDepth)
             {
-                throw new BqlParseException($"The search nests parentheses too deeply (maximum depth: {MaxDepth})");
+                throw new BqlParseException($"The search nests parentheses too deeply (maximum depth: {maxDepth})");
             }
 
             position++;
-            var inner = ParseOr(tokens, ref position, depth + 1);
+            var inner = ParseOr(tokens, ref position, depth + 1, maxDepth);
             if (position >= tokens.Count || tokens[position].Kind != Kind.Close)
             {
                 throw new BqlParseException("Missing ')' in the search");

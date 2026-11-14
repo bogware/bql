@@ -105,12 +105,34 @@ public sealed partial class QueryUnderstander
     [GeneratedRegex(@"Unknown stage: (?<stage>\S+)", RegexOptions.None, 1000)]
     private static partial Regex UnknownStage();
 
+    /// <summary>How long one of the understander's own patterns may run. They are simple; this only guards.</summary>
+    private static readonly TimeSpan PatternTimeout = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Longest input read for meaning: as a question, or for typos to fix. Longer input is parsed
+    /// strictly and runs as typed, or is refused with the parser's reason. Default 2,000 characters.
+    /// </summary>
+    public int MaxInputLength { get; init; } = 2_000;
+
     /// <summary>Understands a query typed into a search box, the CLI or the API.</summary>
     public QueryUnderstanding Understand(string input, FieldCatalog? catalog = null, DateTime? now = null)
     {
         catalog ??= _defaultCatalog;
         var at = now ?? DateTime.UtcNow;
         var text = input.Trim();
+        if (text.Length > MaxInputLength)
+        {
+            // Too long to be a question, and too long to search for typos in cheaply
+            return StrictError(text) is { } tooLongError
+                ? new QueryUnderstanding
+                {
+                    Input = input,
+                    Kind = UnderstandingKind.Unclear,
+                    Problems = [new QueryProblem(0, text.Length, tooLongError.Message)],
+                }
+                : new QueryUnderstanding { Input = input, Kind = UnderstandingKind.Exact, Query = text };
+        }
+
         var segments = SplitPipes(text);
         var strictError = StrictError(text);
 
@@ -301,7 +323,7 @@ public sealed partial class QueryUnderstander
             alternatives.Add(new QueryReadingChoice(reading.Query, reading.Explanation));
         }
 
-        var words = Regex.Replace(SearchVerb().Replace(text, string.Empty), @"[|=<>()""]", " ").Trim();
+        var words = Regex.Replace(SearchVerb().Replace(text, string.Empty), @"[|=<>()""]", " ", RegexOptions.None, PatternTimeout).Trim();
         if (words.Length > 0 && StrictError("find " + words) == null)
         {
             alternatives.Add(new QueryReadingChoice("find " + words, "Search for these words"));
@@ -337,6 +359,10 @@ public sealed partial class QueryUnderstander
         {
             return ex;
         }
+        catch (Exception ex) when (ex is not (OperationCanceledException or OutOfMemoryException))
+        {
+            return new BqlParseException("The query could not be read.", ex);
+        }
     }
 
     private static bool StartsWithStage(string text)
@@ -369,10 +395,10 @@ public sealed partial class QueryUnderstander
     {
         var start = 0;
         var length = text.Length;
-        if (error.Position is { } position && Regex.Match(position, @"\d+") is { Success: true } number && int.TryParse(number.Value, out var at) && at <= text.Length)
+        if (error.Position is { } position && Regex.Match(position, @"\d+", RegexOptions.None, PatternTimeout) is { Success: true } number && int.TryParse(number.Value, out var at) && at <= text.Length)
         {
             start = at;
-            length = Math.Max(1, Regex.Match(text[at..], @"^\S+").Length);
+            length = Math.Max(1, Regex.Match(text[at..], @"^\S+", RegexOptions.None, PatternTimeout).Length);
         }
 
         string? fix = null;

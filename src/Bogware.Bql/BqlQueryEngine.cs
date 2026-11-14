@@ -58,6 +58,20 @@ public sealed class BqlQueryEngine
     /// </summary>
     public BqlQuery Parse(string text, string? dialect = null)
     {
+        try
+        {
+            return ParseCore(text, dialect);
+        }
+        catch (Exception ex) when (ex is not BqlParseException && !BqlFailures.PassesThrough(ex))
+        {
+            // A bug or a case the parser didn't foresee: say so plainly, keep the details for the host.
+            Report(BqlDiagnosticLevel.Error, "The parser failed on a query", ex);
+            throw new BqlParseException("The query could not be read.", ex);
+        }
+    }
+
+    private BqlQuery ParseCore(string text, string? dialect)
+    {
         if (string.IsNullOrEmpty(dialect) || dialect.Equals("bql", StringComparison.OrdinalIgnoreCase) || dialect.Equals("spl", StringComparison.OrdinalIgnoreCase))
         {
             return _parser.ParseBql(text);
@@ -119,16 +133,63 @@ public sealed class BqlQueryEngine
     }
 
     /// <summary>Runs a query and returns its rows.</summary>
-    public async Task<BqlResult> ExecuteAsync(
+    public Task<BqlResult> ExecuteAsync(
         BqlExecutionContext context,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        ExecuteGuardedAsync(context, depth: 0, cancellationToken);
+
+    /// <summary>
+    /// Runs a subsearch for a query: for the same caller, inside the same time bounds, with what is
+    /// left of the same time, one level deeper.
+    /// </summary>
+    internal Task<BqlResult> ExecuteSubsearchAsync(string query, BqlBudget parent, CancellationToken cancellationToken)
+    {
+        var depth = parent.Depth + 1;
+        if (depth > _options.MaxNestingDepth)
+        {
+            throw new BqlLimitExceededException(
+                $"Subsearches and macros nest more than {_options.MaxNestingDepth} deep; one probably refers to itself.");
+        }
+
+        var left = parent.Deadline == DateTime.MaxValue ? (TimeSpan?)null : parent.Deadline - DateTime.UtcNow;
+        var context = new BqlExecutionContext
+        {
+            Query = query,
+            Limit = _options.SubsearchResultLimit,
+            AllowedDatasets = parent.Caller.AllowedDatasets,
+            Dataset = parent.Caller.Dataset,
+            StartTime = parent.StartTime,
+            EndTime = parent.EndTime,
+            Timeout = left is { } remaining ? (remaining > TimeSpan.Zero ? remaining : TimeSpan.FromTicks(1)) : null,
+        };
+        return ExecuteGuardedAsync(context, depth, cancellationToken);
+    }
+
+    private async Task<BqlResult> ExecuteGuardedAsync(BqlExecutionContext context, int depth, CancellationToken cancellationToken)
+    {
+        using var scope = BqlScope.Enter(_options.Limits);
+        try
+        {
+            return await ExecuteCoreAsync(context, depth, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not BqlParseException && !BqlFailures.PassesThrough(ex))
+        {
+            // Never a raw .NET exception or a stack trace in front of the person who typed the query.
+            Report(BqlDiagnosticLevel.Error, "A query failed on an unexpected error", ex);
+            throw new BqlExecutionException("The query stopped on an internal error.", ex);
+        }
+    }
+
+    private async Task<BqlResult> ExecuteCoreAsync(BqlExecutionContext context, int depth, CancellationToken cancellationToken)
     {
         using var span = Telemetry.StartActivity("bql.execute");
 
         // Enforce the per-query timeout by linking to the caller's cancellation token
+        var timeout = context.Timeout ?? _options.DefaultTimeout;
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(context.Timeout ?? _options.DefaultTimeout);
+        timeoutCts.CancelAfter(timeout);
         cancellationToken = timeoutCts.Token;
+        var deadline = timeout < TimeSpan.Zero || timeout >= DateTime.MaxValue - DateTime.UtcNow ? DateTime.MaxValue : DateTime.UtcNow + timeout;
 
         var sw = Stopwatch.StartNew();
         var resultLimit = context.Limit ?? _options.DefaultResultLimit;
@@ -158,7 +219,14 @@ public sealed class BqlQueryEngine
             };
         }
 
-        var budget = new BqlBudget(_options.Limits, Schema);
+        var budget = new BqlBudget(_options.Limits, Schema)
+        {
+            Caller = new BqlCaller(context.AllowedDatasets, context.Dataset),
+            StartTime = context.StartTime,
+            EndTime = context.EndTime,
+            Deadline = deadline,
+            Depth = depth,
+        };
 
         // A source that can aggregate itself saves reading every row
         if (await TryAggregateInSourceAsync(optimized, resultLimit, budget, sw, span, cancellationToken) is { } aggregated)
@@ -587,6 +655,38 @@ public sealed class BqlQueryEngine
         BqlExecutionContext context,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        // Async iterators lose ambient state between rows, so the query's limits are entered
+        // again around each step, and failures are turned into BQL errors here.
+        await using var rows = StreamCoreAsync(context, cancellationToken).GetAsyncEnumerator(cancellationToken);
+        while (true)
+        {
+            bool more;
+            using (BqlScope.Enter(_options.Limits))
+            {
+                try
+                {
+                    more = await rows.MoveNextAsync();
+                }
+                catch (Exception ex) when (ex is not BqlParseException && !BqlFailures.PassesThrough(ex))
+                {
+                    Report(BqlDiagnosticLevel.Error, "A streamed query failed on an unexpected error", ex);
+                    throw new BqlExecutionException("The query stopped on an internal error.", ex);
+                }
+            }
+
+            if (!more)
+            {
+                yield break;
+            }
+
+            yield return rows.Current;
+        }
+    }
+
+    private async IAsyncEnumerable<dynamic> StreamCoreAsync(
+        BqlExecutionContext context,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCts.CancelAfter(context.Timeout ?? _options.DefaultTimeout);
         var token = timeoutCts.Token;
@@ -599,7 +699,12 @@ public sealed class BqlQueryEngine
         {
             // Only row stages remain, so nothing has to be held in memory
             var count = 0;
-            var budget = new BqlBudget(_options.Limits, Schema);
+            var budget = new BqlBudget(_options.Limits, Schema)
+            {
+                Caller = new BqlCaller(context.AllowedDatasets, context.Dataset),
+                StartTime = context.StartTime,
+                EndTime = context.EndTime,
+            };
             var plan = CreatePlan(optimized.RemainingStages, resultLimit, budget);
             await foreach (var batch in ReadBatchesAsync(optimized.Pushdown, plan with { Sink = new MaterializeSink(budget) }, token))
             {
@@ -659,7 +764,7 @@ public sealed class BqlQueryEngine
     private BqlOperator? CreateOperator(BqlStage stage, BqlBudget budget) => stage switch
     {
         BoundsStage b => new BoundsOperator(b),
-        SearchStage s => new LegacySearchOperator(s.SearchText),
+        SearchStage s => new LegacySearchOperator(s.SearchText, _options.Parser.MaxSearchDepth),
         WhereStage w => new LegacyWhereOperator(w.Condition),
         StatsStage st => new LegacyStatsOperator(st.Aggregations, st.GroupByFields),
         SortStage so => new LegacySortOperator(so.Fields),
@@ -701,7 +806,7 @@ public sealed class BqlQueryEngine
         MacroStage m => _options.Knowledge != null
             ? new LegacyMacroOperator(m.MacroName, m.Arguments, this, _options.Knowledge)
             : throw new BqlExecutionException("macros need a macro store, and this host has none"),
-        SubsearchStage ss => new LegacySubsearchOperator(ss.SubsearchQuery, this),
+        SubsearchStage ss => new LegacySubsearchOperator(ss.SubsearchQuery, this, budget),
         MultisearchStage ms => new LegacyMultisearchOperator(ms.SearchQueries, this, budget),
         _ => throw new BqlExecutionException($"The {stage.StageName} stage isn't supported here")
     };
